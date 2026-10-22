@@ -144,7 +144,7 @@ Ascend 不占用 CUDA 的 64 字节槽；torch_npu IPC 元组放在 JSON 的 `np
 - 警告：`Producer process has been terminated before all shared NPU tensors released`
 - 随后 `receiver_node` `SIGSEGV`
 
-示例 `receiver.py` 因此在最后一帧 `free_tensor_pool` 之后、发送 `next_require` 之前，对 NPU 接收端执行 `torch_tensor = None; gc.collect()`。
+示例 `receiver.py` 因此在最后一帧 `free_tensor_pool` 之后、发送 `next_require` 之前，对 NPU 接收端同时清除 `torch_tensor` 和包含内部 `_tensor` 引用的 `tensor_info`，再执行 `gc.collect()`。只清除 `torch_tensor` 不够：最后一次 `tensor_info` 字典仍会持有共享 NPU tensor，导致生产者退出时继续报告未释放引用。
 
 ## 验证
 
@@ -162,3 +162,4 @@ dora run libraries/extensions/tensor-pool/examples/cpu2npu.yml
 ```
 
 期望接收端输出 `device='npu:0'` 的相同数据，并在 100 帧后正常释放 pool。
+

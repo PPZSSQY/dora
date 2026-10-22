@@ -137,6 +137,7 @@ for i in range(MESSAGE_COUNT):
         and SCENARIO != "auto_cleanup"
     ):
         torch_tensor = None
+        tensor_info = None
         gc.collect()
 
     node.send_output("next_require", pa.array([]))
