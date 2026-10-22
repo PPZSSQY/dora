@@ -20,6 +20,14 @@ SCENARIO = os.getenv("memory_pool_scenario", "throughput")
 if SENDER_DEVICE.startswith("cuda"):
     idx = int(SENDER_DEVICE.split(":")[1]) if ":" in SENDER_DEVICE else 0
     torch.cuda.set_device(idx)
+elif SENDER_DEVICE.startswith("npu"):
+    # torch_npu 在创建张量前完成本进程的 AscendCL 初始化并选定设备。
+    # tensor-pool 拷贝时还会调用 aclInit；若这里已经初始化，官方返回
+    # ACL_ERROR_REPEAT_INITIALIZE，传输层会忽略并继续。
+    import torch_npu  # noqa: F401
+
+    idx = int(SENDER_DEVICE.split(":")[1]) if ":" in SENDER_DEVICE else 0
+    torch.npu.set_device(idx)
 
 node = Node("sender_node")
 data_generation = np.random.default_rng()

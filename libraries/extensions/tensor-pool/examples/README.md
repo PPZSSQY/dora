@@ -31,6 +31,8 @@ python -c "import torch; assert torch.cuda.is_available()"
 - `cpu2cpu.yml` — positive throughput test for CPU sender → CPU receiver (GPU-less CI safe).
 - `cpu2cuda.yml` — positive throughput test for CPU sender → CUDA receiver.
 - `cuda2cpu.yml` — positive throughput test for CUDA sender → CPU receiver.
+- `npu2cpu.yml` — single-machine Ascend NPU sender → CPU receiver (requires
+  `torch_npu`, CANN 8.x/9.x, and `libascendcl.so`).
 - `duplicate_free.yml` — receiver frees the same memory pool twice (CPU receiver).
 - `read_after_free.yml` — receiver frees, then reads the same memory pool again (CPU receiver).
 - `write_after_free.yml` — sender frees, then writes the same memory pool again (CPU receiver).

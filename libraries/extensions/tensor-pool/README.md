@@ -1,10 +1,15 @@
-# tensor-pool — pinned-host / CUDA tensor transport
+# tensor-pool — pinned-host / accelerator tensor transport
 
 Zero-copy handoff of large tensors between dora nodes: the producer registers a
 shared-tensor pool once and overwrites it per frame, so a repeated 8 MB camera
 frame does not travel through the normal message path every tick. CUDA sources
 and sinks get DMA and IPC paths on top; a CPU-only machine gets plain shared
 memory.
+
+Ascend support is currently limited to the **single-machine NPU-to-CPU** path.
+An NPU tensor created by `torch_npu` is copied synchronously into the existing
+shared-memory data region through AscendCL. CPU-to-NPU, NPU-to-NPU, Ascend IPC,
+and cross-machine Ascend paths are not implemented yet.
 
 ## ⚠️ Not covered by dora's 1.0 compatibility guarantees
 
