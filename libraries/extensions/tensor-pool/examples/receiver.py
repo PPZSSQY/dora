@@ -20,6 +20,11 @@ if RECEIVER_DEVICE.startswith("cuda") and not torch.cuda.is_available():
 if RECEIVER_DEVICE.startswith("cuda"):
     idx = int(RECEIVER_DEVICE.split(":")[1]) if ":" in RECEIVER_DEVICE else 0
     torch.cuda.set_device(idx)
+elif RECEIVER_DEVICE.startswith("npu"):
+    import torch_npu  # noqa: F401
+
+    idx = int(RECEIVER_DEVICE.split(":")[1]) if ":" in RECEIVER_DEVICE else 0
+    torch.npu.set_device(idx)
 
 pbar = tqdm(total=MESSAGE_COUNT)
 velocities = []

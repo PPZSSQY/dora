@@ -105,6 +105,13 @@ def tensor_from_info(tensor_info: dict) -> torch.Tensor:
     tensor that produced the ``tensor_info``.  Used by consumers that read
     a tensor pool via ``read_tensor_pool``.
     """
+    # Ascend IPC is rebuilt by the transport through torch_npu's storage
+    # sharing API. Returning that object preserves its Storage owner and avoids
+    # trying to wrap a bare NPU pointer through CUDA's array interface.
+    npu_tensor = tensor_info.get("_tensor")
+    if npu_tensor is not None:
+        return npu_tensor
+
     ptr = tensor_info.get('ptr', 0)
     if ptr == 0:
         raise ValueError("tensor_info has null pointer (ptr=0); pool may not exist or has been freed")
