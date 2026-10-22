@@ -135,6 +135,17 @@ Ascend 不占用 CUDA 的 64 字节槽；torch_npu IPC 元组放在 JSON 的 `np
 - `receiver_device: npu`
 - 复用 `sender.py`、`receiver.py` 和逐帧握手机制
 
+## 生命周期注意（SIGSEGV）
+
+`torch_npu` 设备 IPC 要求：**消费者先释放导入的 tensor，生产者进程才能退出**。
+
+若接收端仍握着导入的 NPU 张量（例如示例里的 `torch_tensor`），而发送端已因最后一次 `next_require` 退出并销毁 `_share_npu_` 侧缓冲，接收端退出析构时可能出现：
+
+- 警告：`Producer process has been terminated before all shared NPU tensors released`
+- 随后 `receiver_node` `SIGSEGV`
+
+示例 `receiver.py` 因此在最后一帧 `free_tensor_pool` 之后、发送 `next_require` 之前，对 NPU 接收端执行 `torch_tensor = None; gc.collect()`。
+
 ## 验证
 
 本地仅执行了不依赖 NPU 环境的静态检查：

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Receive tensors through the memory-pool example dataflow."""
 
+import gc
 import os
 import time
 
@@ -126,6 +127,17 @@ for i in range(MESSAGE_COUNT):
             pass  # Expected: pool was freed, read should fail
     elif SCENARIO != "auto_cleanup" and i == MESSAGE_COUNT - 1:
         node.free_tensor_pool(memory_pool_id)
+
+    # torch_npu device IPC requires the consumer to drop imported tensors
+    # before the producer process exits. next_require is what lets the
+    # sender finish, so clear the local NPU view first.
+    if (
+        RECEIVER_DEVICE.startswith("npu")
+        and i == MESSAGE_COUNT - 1
+        and SCENARIO != "auto_cleanup"
+    ):
+        torch_tensor = None
+        gc.collect()
 
     node.send_output("next_require", pa.array([]))
     pbar.update(1)
