@@ -112,3 +112,12 @@ dora run libraries/extensions/tensor-pool/examples/npu2npu_nop2p.yml
 ```
 
 该示例必须打印 `Ascend NPU IPC path: host transit`。单元测试 `npu_cross_card_disable_p2p_must_use_host_transit` 锁住同一条决策。
+
+### `examples/bench_h2d_d2d.py`
+
+新建，不走 dataflow。同一 payload（`15000*512*int64`）分别测：
+
+- `torch` 的 Host→设备、同卡 D2D
+- `aclrtMemcpy` 的 pageable H2D、锁页 H2D、同卡 D2D（与 tensor-pool 同接口）
+
+用来对照 `cpu2npu` / `npu_inner` 的吞吐，而不是改传输路径。
