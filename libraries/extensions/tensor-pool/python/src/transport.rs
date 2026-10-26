@@ -830,6 +830,42 @@ fn classify_transport(
     TransportPath::HostStagingTransit
 }
 
+const ASCEND_DISABLE_P2P_ENV: &str = "DORA_TENSOR_POOL_ASCEND_DISABLE_P2P";
+
+fn ascend_p2p_disabled() -> bool {
+    matches!(
+        std::env::var(ASCEND_DISABLE_P2P_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// NPU→NPU fill path. `p2p_disabled` forces host transit even when peer
+/// access exists, so the no-P2P fallback can be exercised on hardware
+/// that would otherwise always take P2P.
+#[inline]
+fn classify_npu_copy(
+    sender_device: i32,
+    receiver_device: i32,
+    p2p_available: bool,
+    p2p_disabled: bool,
+) -> TransportPath {
+    if sender_device == receiver_device {
+        return TransportPath::SameDeviceDtoD;
+    }
+    if p2p_available && !p2p_disabled {
+        return TransportPath::P2PPeerAccess;
+    }
+    TransportPath::HostStagingTransit
+}
+
+fn npu_copy_path_label(path: TransportPath) -> &'static str {
+    match path {
+        TransportPath::SameDeviceDtoD => "same-device D2D",
+        TransportPath::P2PPeerAccess => "P2P D2D",
+        TransportPath::HostStagingTransit => "host transit",
+    }
+}
+
 /// Which write path `write_tensor_pool` dispatches to for a given frame.
 ///
 /// The fast and slow write paths both branch on the same 2×2×2 matrix
@@ -949,6 +985,48 @@ mod transport_tests {
     fn cross_device_with_p2p() {
         assert_eq!(
             classify_transport(0, 1, true, true),
+            TransportPath::P2PPeerAccess
+        );
+    }
+
+    #[test]
+    fn npu_same_card_never_uses_p2p() {
+        assert_eq!(
+            classify_npu_copy(0, 0, true, false),
+            TransportPath::SameDeviceDtoD
+        );
+        assert_eq!(
+            classify_npu_copy(0, 0, true, true),
+            TransportPath::SameDeviceDtoD
+        );
+    }
+
+    #[test]
+    fn npu_cross_card_uses_p2p_when_available() {
+        assert_eq!(
+            classify_npu_copy(0, 1, true, false),
+            TransportPath::P2PPeerAccess
+        );
+    }
+
+    #[test]
+    fn npu_cross_card_disable_p2p_must_use_host_transit() {
+        // Hardware that can P2P must still take transit when the
+        // disable flag is on — this is the no-P2P regression.
+        assert_eq!(
+            classify_npu_copy(0, 1, true, true),
+            TransportPath::HostStagingTransit
+        );
+        assert_eq!(
+            classify_npu_copy(0, 1, false, true),
+            TransportPath::HostStagingTransit
+        );
+        assert_eq!(
+            classify_npu_copy(0, 1, false, false),
+            TransportPath::HostStagingTransit
+        );
+        assert_ne!(
+            classify_npu_copy(0, 1, true, true),
             TransportPath::P2PPeerAccess
         );
     }
@@ -1715,8 +1793,9 @@ def _npu_memcpy(dst, src, size, kind, what):
             f"aclrtMemcpy {what} (0x{dst:x} <- 0x{src:x}, {size}B) failed: {err}"
         )
 
-def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev):
+def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev, path):
     """Allocate the pool on the receiver NPU, copy the first NPU frame, export IPC."""
+    print(f"Ascend NPU IPC path: {path}", flush=True)
     _ensure_npu_runtime(dst_dev)
     alloc_size = _aligned_ipc_size(size)
     policy = (
@@ -1728,14 +1807,14 @@ def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev):
         raise RuntimeError(f"aclrtMalloc({alloc_size}, policy={policy}) failed: {err}")
     transit_ptr = 0
     try:
-        if src_dev == dst_dev:
+        if path == "same-device D2D":
             _ensure_npu_runtime(src_dev)
             _npu_memcpy(d_ptr.value, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "D2D")
-        elif _npu_can_access_peer(src_dev, dst_dev):
+        elif path == "P2P D2D":
             _npu_ensure_p2p_pair(src_dev, dst_dev)
             _ensure_npu_runtime(src_dev)
             _npu_memcpy(d_ptr.value, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "P2P D2D")
-        else:
+        elif path == "host transit":
             host = ctypes.c_void_p()
             err = _acl.aclrtMallocHost(ctypes.byref(host), size)
             if err != ACL_SUCCESS or not host.value:
@@ -1745,6 +1824,8 @@ def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev):
             _npu_memcpy(transit_ptr, src, size, ACL_MEMCPY_DEVICE_TO_HOST, "D2H transit")
             _ensure_npu_runtime(dst_dev)
             _npu_memcpy(d_ptr.value, transit_ptr, size, ACL_MEMCPY_HOST_TO_DEVICE, "H2D transit")
+        else:
+            raise ValueError(f"unknown Ascend NPU IPC path: {path}")
         handle = _npu_export_key(d_ptr.value, alloc_size)
     except Exception:
         if transit_ptr:
@@ -2415,11 +2496,34 @@ impl Pool<'_> {
             let helpers = get_ascend_helpers(py).map_err(|e| eyre::eyre!(e))?;
             let handle = if is_npu {
                 let src_index = npu_device_index(&tensor_device).map_err(|e| eyre::eyre!(e))?;
+                let p2p_available = helpers
+                    .bind(py)
+                    .call_method1("_npu_can_access_peer", (src_index, device_index))
+                    .and_then(|v| v.extract::<bool>())
+                    .unwrap_or(false);
+                let path = classify_npu_copy(
+                    src_index,
+                    device_index,
+                    p2p_available,
+                    ascend_p2p_disabled(),
+                );
+                let path_label = npu_copy_path_label(path);
+                tracing::info!(
+                    "[{}] Ascend NPU IPC path: {path_label} (src=npu:{src_index}, dst=npu:{device_index})",
+                    self.node_id
+                );
                 helpers
                     .bind(py)
                     .call_method1(
                         "_setup_npu_ipc_from_npu",
-                        (&buffer_id, ptr_val, size, src_index, device_index),
+                        (
+                            &buffer_id,
+                            ptr_val,
+                            size,
+                            src_index,
+                            device_index,
+                            path_label,
+                        ),
                     )
                     .map_err(|e| {
                         eyre::eyre!(

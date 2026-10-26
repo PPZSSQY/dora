@@ -79,6 +79,10 @@ CPU→NPU 的 `_create_npu_ipc_buffer` / `_npu_memcpy_htod` 不变。
 
 新建，对齐 `cuda_inner.yml`：`npu:0 → npu:0`。
 
+### `examples/npu2npu_nop2p.yml`
+
+新建：跨卡但 `DORA_TENSOR_POOL_ASCEND_DISABLE_P2P=1`，必须走 host transit。
+
 复用现有 `sender.py` / `receiver.py`（已有 NPU 初始化）。
 
 ## 验证
@@ -91,3 +95,19 @@ dora run libraries/extensions/tensor-pool/examples/npu2npu.yml
 ```
 
 期望接收端 `device='npu:0'`（同卡）或 `device='npu:1'`（跨卡），100 帧后正常释放。
+
+注册时发送端会打印一行路径，例如：
+
+```text
+Ascend NPU IPC path: same-device D2D
+Ascend NPU IPC path: P2P D2D
+Ascend NPU IPC path: host transit
+```
+
+强制不走 P2P（即使驱动支持 peer）时设 `DORA_TENSOR_POOL_ASCEND_DISABLE_P2P=1`，或跑：
+
+```bash
+dora run libraries/extensions/tensor-pool/examples/npu2npu_nop2p.yml
+```
+
+该示例必须打印 `Ascend NPU IPC path: host transit`。单元测试 `npu_cross_card_disable_p2p_must_use_host_transit` 锁住同一条决策。
