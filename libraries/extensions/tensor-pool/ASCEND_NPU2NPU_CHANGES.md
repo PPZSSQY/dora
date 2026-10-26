@@ -50,7 +50,7 @@
 现逻辑（在原 helper 上增加，不改 CUDA helper）：
 
 - `_setup_npu_ipc_from_npu`：接收卡建池、首帧 D2D / P2P / 中转、导出 65 字节 key。
-- `_npu_memcpy_npu_to_pool`：后续帧按同一路径覆盖。
+- `_npu_memcpy_npu_to_pool`：后续帧按同一路径覆盖。同卡 D2D 后来改为 `torch.copy_`，见 `ASCEND_NPU_SAME_DEVICE_COPY_CHANGES.md`。
 - `_npu_can_access_peer` / `_npu_ensure_p2p_pair`：对应 CANN 的 peer 查询与打开。
 - `_release_npu_sender`：额外 `aclrtFreeHost` 释放中转缓冲；释放前同步源卡/接收卡，释放后把 ACL 与 `torch.npu` 切回源卡。跨卡中转拷完同样切回源卡，避免进程退出时 `107003 stream is not in the current context`。
 - `_restore_owner_device` / `_npu_sync_device`：对齐当前卡上下文。

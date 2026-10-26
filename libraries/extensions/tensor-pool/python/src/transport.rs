@@ -1813,6 +1813,22 @@ def _npu_memcpy(dst, src, size, kind, what):
             f"aclrtMemcpy {what} (0x{dst:x} <- 0x{src:x}, {size}B) failed: {err}"
         )
 
+def _npu_same_device_d2d(dst, src, size, device_index):
+    """Same-card D2D via torch.copy_. Sync aclrtMemcpy D2D is the slow path."""
+    import torch
+    import torch_npu  # noqa: F401
+    from dora_tensor_pool.tensor_info import _wrap_npu_ptr
+
+    device = f"npu:{int(device_index)}"
+    nbytes = int(size)
+    src_t = _wrap_npu_ptr(int(src), [nbytes], torch.uint8, device, nbytes)
+    dst_t = _wrap_npu_ptr(int(dst), [nbytes], torch.uint8, device, nbytes)
+    try:
+        dst_t.copy_(src_t)
+        torch.npu.synchronize()
+    finally:
+        del src_t, dst_t
+
 def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev, path):
     """Allocate the pool on the receiver NPU, copy the first NPU frame, export IPC."""
     print(f"Ascend NPU IPC path: {path}", flush=True)
@@ -1829,7 +1845,7 @@ def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev, path):
     try:
         if path == "same-device D2D":
             _ensure_npu_runtime(src_dev)
-            _npu_memcpy(d_ptr.value, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "D2D")
+            _npu_same_device_d2d(d_ptr.value, src, size, src_dev)
         elif path == "P2P D2D":
             _npu_ensure_p2p_pair(src_dev, dst_dev)
             _ensure_npu_runtime(src_dev)
@@ -1886,8 +1902,11 @@ def _npu_memcpy_npu_to_pool(pool_id, src, size):
             return
         if src_dev != dst_dev:
             _npu_ensure_p2p_pair(src_dev, dst_dev)
+            _ensure_npu_runtime(src_dev)
+            _npu_memcpy(slot["ptr"], src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "P2P D2D")
+            return
         _ensure_npu_runtime(src_dev)
-        _npu_memcpy(slot["ptr"], src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "D2D")
+        _npu_same_device_d2d(slot["ptr"], src, size, src_dev)
     finally:
         _restore_owner_device(src_dev)
 

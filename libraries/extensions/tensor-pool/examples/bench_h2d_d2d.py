@@ -167,6 +167,28 @@ def bench_acl(device_index: int) -> None:
             f"ACL D2D same-device: {mb_per_s(mean_s(samples)):.1f} MB/s  "
             f"({mean_s(samples)*1e3:.2f} ms)"
         )
+
+        from dora_tensor_pool.tensor_info import _wrap_npu_ptr
+
+        src_host = torch.from_numpy(pageable)
+        src_dev = src_host.to(f"npu:{device_index}")
+        device = f"npu:{device_index}"
+        dst_t = _wrap_npu_ptr(int(d1.value), [BYTES], torch.uint8, device, BYTES)
+        src_bytes = _wrap_npu_ptr(int(src_dev.data_ptr()), [BYTES], torch.uint8, device, BYTES)
+        for _ in range(WARMUP):
+            dst_t.copy_(src_bytes)
+            torch.npu.synchronize()
+        samples = []
+        for _ in range(ITERS):
+            torch.npu.synchronize()
+            t0 = time.perf_counter()
+            dst_t.copy_(src_bytes)
+            torch.npu.synchronize()
+            samples.append(time.perf_counter() - t0)
+        print(
+            f"torch.copy_ into aclrtMalloc: {mb_per_s(mean_s(samples)):.1f} MB/s  "
+            f"({mean_s(samples)*1e3:.2f} ms)"
+        )
     finally:
         acl.aclrtFree(d0)
         acl.aclrtFree(d1)
