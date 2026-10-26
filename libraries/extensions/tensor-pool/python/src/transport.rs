@@ -1514,14 +1514,35 @@ _acl.aclrtIpcMemImportByKey.argtypes = [
 _acl.aclrtIpcMemClose.restype = ctypes.c_int
 _acl.aclrtIpcMemClose.argtypes = [ctypes.c_char_p]
 
+_acl.aclrtGetDevice.restype = ctypes.c_int
+_acl.aclrtGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int32)]
+
+_acl.aclrtDeviceCanAccessPeer.restype = ctypes.c_int
+_acl.aclrtDeviceCanAccessPeer.argtypes = [
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.c_int32,
+    ctypes.c_int32,
+]
+
+_acl.aclrtDeviceEnablePeerAccess.restype = ctypes.c_int
+_acl.aclrtDeviceEnablePeerAccess.argtypes = [ctypes.c_int32, ctypes.c_uint32]
+
+_acl.aclrtMallocHost.restype = ctypes.c_int
+_acl.aclrtMallocHost.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+
+_acl.aclrtFreeHost.restype = ctypes.c_int
+_acl.aclrtFreeHost.argtypes = [ctypes.c_void_p]
+
 ACL_SUCCESS = 0
 # Official aclInit contract: a second call returns this and must be ignored.
 ACL_ERROR_REPEAT_INITIALIZE = 100002
 # aclrtMemcpyKind from CANN 8.x/9.x acl_rt.h.
 ACL_MEMCPY_HOST_TO_DEVICE = 1
 ACL_MEMCPY_DEVICE_TO_HOST = 2
+ACL_MEMCPY_DEVICE_TO_DEVICE = 3
 # aclrtMemMallocPolicy from CANN 8.x/9.x acl_rt.h.
 ACL_MEM_MALLOC_HUGE_FIRST = 0
+ACL_MEM_MALLOC_HUGE_FIRST_P2P = 3
 ACL_IPC_MEM_KEY_LEN = 65
 ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION = 0x1
 ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT = 0x0
@@ -1531,6 +1552,7 @@ _acl_ready = False
 _current_device = None
 _npu_sender_buffers = {}
 _npu_receiver_buffers = {}
+_p2p_enabled_pairs = set()
 
 def _ensure_npu_runtime(device_index):
     """Initialize AscendCL once and select the tensor's NPU when it changes."""
@@ -1635,6 +1657,134 @@ def _npu_memcpy_htod(pool_id, src, size):
             f"aclrtMemcpy H2D (0x{slot['ptr']:x} <- 0x{src:x}, {size}B) failed: {err}"
         )
 
+def _npu_get_device():
+    dev = ctypes.c_int32(-1)
+    if _acl.aclrtGetDevice(ctypes.byref(dev)) == ACL_SUCCESS:
+        return int(dev.value)
+    return -1
+
+def _npu_can_access_peer(src, dst):
+    can = ctypes.c_int32(0)
+    if _acl.aclrtDeviceCanAccessPeer(ctypes.byref(can), src, dst) == ACL_SUCCESS:
+        return can.value != 0
+    return False
+
+def _npu_ensure_p2p_pair(a, b):
+    if a == b or a < 0 or b < 0:
+        return
+    if (a, b) in _p2p_enabled_pairs:
+        return
+    saved = _npu_get_device()
+    for src, dst in ((a, b), (b, a)):
+        if _npu_can_access_peer(src, dst):
+            _ensure_npu_runtime(src)
+            err = _acl.aclrtDeviceEnablePeerAccess(dst, 0)
+            if err != ACL_SUCCESS:
+                raise RuntimeError(
+                    f"aclrtDeviceEnablePeerAccess({src} -> {dst}) failed: {err}"
+                )
+        _p2p_enabled_pairs.add((src, dst))
+    if saved >= 0:
+        _ensure_npu_runtime(saved)
+
+def _npu_export_key(d_ptr, alloc_size):
+    key = ctypes.create_string_buffer(ACL_IPC_MEM_KEY_LEN)
+    err = _acl.aclrtIpcMemGetExportKey(
+        ctypes.c_void_p(d_ptr),
+        alloc_size,
+        key,
+        ACL_IPC_MEM_KEY_LEN,
+        ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
+    )
+    if err != ACL_SUCCESS:
+        raise RuntimeError(
+            f"aclrtIpcMemGetExportKey(0x{d_ptr:x}, {alloc_size}) failed: {err}"
+        )
+    return bytes(key.raw)
+
+def _npu_memcpy(dst, src, size, kind, what):
+    err = _acl.aclrtMemcpy(
+        ctypes.c_void_p(dst),
+        size,
+        ctypes.c_void_p(src),
+        size,
+        kind,
+    )
+    if err != ACL_SUCCESS:
+        raise RuntimeError(
+            f"aclrtMemcpy {what} (0x{dst:x} <- 0x{src:x}, {size}B) failed: {err}"
+        )
+
+def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev):
+    """Allocate the pool on the receiver NPU, copy the first NPU frame, export IPC."""
+    _ensure_npu_runtime(dst_dev)
+    alloc_size = _aligned_ipc_size(size)
+    policy = (
+        ACL_MEM_MALLOC_HUGE_FIRST_P2P if src_dev != dst_dev else ACL_MEM_MALLOC_HUGE_FIRST
+    )
+    d_ptr = ctypes.c_void_p()
+    err = _acl.aclrtMalloc(ctypes.byref(d_ptr), alloc_size, policy)
+    if err != ACL_SUCCESS or not d_ptr.value:
+        raise RuntimeError(f"aclrtMalloc({alloc_size}, policy={policy}) failed: {err}")
+    transit_ptr = 0
+    try:
+        if src_dev == dst_dev:
+            _ensure_npu_runtime(src_dev)
+            _npu_memcpy(d_ptr.value, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "D2D")
+        elif _npu_can_access_peer(src_dev, dst_dev):
+            _npu_ensure_p2p_pair(src_dev, dst_dev)
+            _ensure_npu_runtime(src_dev)
+            _npu_memcpy(d_ptr.value, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "P2P D2D")
+        else:
+            host = ctypes.c_void_p()
+            err = _acl.aclrtMallocHost(ctypes.byref(host), size)
+            if err != ACL_SUCCESS or not host.value:
+                raise RuntimeError(f"aclrtMallocHost({size}) failed: {err}")
+            transit_ptr = host.value
+            _ensure_npu_runtime(src_dev)
+            _npu_memcpy(transit_ptr, src, size, ACL_MEMCPY_DEVICE_TO_HOST, "D2H transit")
+            _ensure_npu_runtime(dst_dev)
+            _npu_memcpy(d_ptr.value, transit_ptr, size, ACL_MEMCPY_HOST_TO_DEVICE, "H2D transit")
+        handle = _npu_export_key(d_ptr.value, alloc_size)
+    except Exception:
+        if transit_ptr:
+            _acl.aclrtFreeHost(ctypes.c_void_p(transit_ptr))
+        _acl.aclrtFree(d_ptr)
+        raise
+    _npu_sender_buffers[pool_id] = {
+        "ptr": d_ptr.value,
+        "size": size,
+        "alloc_size": alloc_size,
+        "key": handle,
+        "device_index": dst_dev,
+        "src_device": src_dev,
+        "transit_ptr": transit_ptr,
+    }
+    return handle
+
+def _npu_memcpy_npu_to_pool(pool_id, src, size):
+    """Overwrite the sender-side Ascend IPC buffer from an NPU source tensor."""
+    slot = _npu_sender_buffers.get(pool_id)
+    if slot is None:
+        raise RuntimeError(f"Ascend IPC sender buffer not found: {pool_id}")
+    if size > slot["size"]:
+        raise ValueError(
+            f"Ascend IPC write {size}B exceeds buffer capacity {slot['size']}B"
+        )
+    src_dev = slot.get("src_device", slot["device_index"])
+    dst_dev = slot["device_index"]
+    transit_ptr = slot.get("transit_ptr", 0)
+    if transit_ptr:
+        _ensure_npu_runtime(src_dev)
+        _npu_memcpy(transit_ptr, src, size, ACL_MEMCPY_DEVICE_TO_HOST, "D2H transit")
+        _ensure_npu_runtime(dst_dev)
+        _npu_memcpy(slot["ptr"], transit_ptr, size, ACL_MEMCPY_HOST_TO_DEVICE, "H2D transit")
+        return
+    if src_dev != dst_dev:
+        _npu_ensure_p2p_pair(src_dev, dst_dev)
+    _ensure_npu_runtime(src_dev)
+    _npu_memcpy(slot["ptr"], src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "D2D")
+
 def _import_npu_ipc(pool_id, handle_bytes, size, device_index):
     """Import a 65-byte Ascend IPC key and return the local device pointer."""
     cached = _npu_receiver_buffers.get(pool_id)
@@ -1668,6 +1818,9 @@ def _release_npu_sender(pool_id):
         return
     key = ctypes.create_string_buffer(slot["key"], ACL_IPC_MEM_KEY_LEN)
     _acl.aclrtIpcMemClose(key)
+    transit_ptr = slot.get("transit_ptr", 0)
+    if transit_ptr:
+        _acl.aclrtFreeHost(ctypes.c_void_p(transit_ptr))
     _acl.aclrtFree(ctypes.c_void_p(slot["ptr"]))
 
 def _release_npu_receiver(pool_id):
@@ -1734,6 +1887,20 @@ fn copy_host_to_npu_pool(
         .call_method1("_npu_memcpy_htod", (pool_id, src, size))
         .map(|_| ())
         .map_err(|e| format!("AscendCL CPU-to-NPU IPC copy failed: {e}"))
+}
+
+fn copy_npu_to_npu_pool(
+    py: Python<'_>,
+    pool_id: &str,
+    src: u64,
+    size: usize,
+) -> Result<(), String> {
+    let helpers = get_ascend_helpers(py)?;
+    helpers
+        .bind(py)
+        .call_method1("_npu_memcpy_npu_to_pool", (pool_id, src, size))
+        .map(|_| ())
+        .map_err(|e| format!("AscendCL NPU-to-NPU IPC copy failed: {e}"))
 }
 
 /// Read 8 consecutive bytes from `p` as a little-endian u64,
@@ -2149,22 +2316,22 @@ impl Pool<'_> {
         let receiver_is_npu = is_npu_device(&device);
         let receiver_is_accelerator = receiver_is_cuda || receiver_is_npu;
         let cross_machine = machine.is_some();
-        // Ascend 设备 IPC 当前只实现单机 CPU → NPU。
-        if receiver_is_npu && tensor_device != "cpu" {
+        // Ascend 设备 IPC：单机 CPU→NPU / NPU→NPU；跨机仍不支持。
+        if receiver_is_npu && !(tensor_device == "cpu" || is_npu) {
             eyre::bail!(
-                "Ascend CPU-to-NPU IPC requires a CPU source; \
+                "Ascend NPU IPC requires a CPU or NPU source; \
                  source `{tensor_device}` is not supported for receiver `{device}`"
             );
         }
-        if is_npu && device != "cpu" {
+        if is_npu && !(device == "cpu" || receiver_is_npu) {
             eyre::bail!(
-                "Ascend tensor-pool currently supports only NPU-to-CPU; \
+                "Ascend NPU source currently supports NPU-to-CPU or NPU-to-NPU; \
                  receiver `{device}` is not supported for NPU source `{tensor_device}`"
             );
         }
         if receiver_is_npu && cross_machine {
             eyre::bail!(
-                "Ascend CPU-to-NPU IPC is single-machine only; \
+                "Ascend NPU IPC is single-machine only; \
                  cross-machine receiver `{device}` is not implemented"
             );
         }
@@ -2241,33 +2408,50 @@ impl Pool<'_> {
         header_meta.set_item("pinned_type", pinned_type)?;
         header_meta.set_item("device", &device)?;
 
-        // 【Ascend CPU → NPU】aclrtMalloc + H2D + 65 字节 IPC key，写入固定头。
+        // 【Ascend】aclrtMalloc 接收卡池缓冲 + 首帧拷贝 + 65 字节 IPC key。
         let mut npu_handle: Option<Vec<u8>> = None;
         if receiver_is_npu {
             let device_index = npu_device_index(&device).map_err(|e| eyre::eyre!(e))?;
             let helpers = get_ascend_helpers(py).map_err(|e| eyre::eyre!(e))?;
-            let handle = helpers
-                .bind(py)
-                .call_method1(
-                    "_create_npu_ipc_buffer",
-                    (&buffer_id, ptr_val, size, device_index),
-                )
-                .map_err(|e| {
-                    eyre::eyre!(
-                        "[{}] register_tensor_pool: Ascend CPU-to-NPU IPC setup failed: {}",
-                        self.node_id,
-                        e
+            let handle = if is_npu {
+                let src_index = npu_device_index(&tensor_device).map_err(|e| eyre::eyre!(e))?;
+                helpers
+                    .bind(py)
+                    .call_method1(
+                        "_setup_npu_ipc_from_npu",
+                        (&buffer_id, ptr_val, size, src_index, device_index),
                     )
-                })
-                .and_then(|v| {
-                    v.extract::<Vec<u8>>().map_err(|e| {
+                    .map_err(|e| {
                         eyre::eyre!(
-                            "[{}] register_tensor_pool: Ascend IPC key extract failed: {}",
+                            "[{}] register_tensor_pool: Ascend NPU-to-NPU IPC setup failed: {}",
                             self.node_id,
                             e
                         )
                     })
-                });
+            } else {
+                helpers
+                    .bind(py)
+                    .call_method1(
+                        "_create_npu_ipc_buffer",
+                        (&buffer_id, ptr_val, size, device_index),
+                    )
+                    .map_err(|e| {
+                        eyre::eyre!(
+                            "[{}] register_tensor_pool: Ascend CPU-to-NPU IPC setup failed: {}",
+                            self.node_id,
+                            e
+                        )
+                    })
+            }
+            .and_then(|v| {
+                v.extract::<Vec<u8>>().map_err(|e| {
+                    eyre::eyre!(
+                        "[{}] register_tensor_pool: Ascend IPC key extract failed: {}",
+                        self.node_id,
+                        e
+                    )
+                })
+            });
             match handle {
                 Ok(bytes) if bytes.len() == ASCEND_HANDLE_LEN => npu_handle = Some(bytes),
                 Ok(bytes) => {
@@ -3034,9 +3218,8 @@ impl Pool<'_> {
                         let ipc_present =
                             unsafe { std::ptr::read(shmem_ptr.add(24) as *const u64) };
 
-                        // An IPC-backed pool has no shmem payload region. Ascend
-                        // NPU-to-CPU must never write into it.
-                        if is_npu && ipc_present != DEVICE_CPU {
+                        // An IPC-backed CUDA pool has no shmem payload region.
+                        if is_npu && ipc_present == DEVICE_CUDA {
                             if let Some(slot_data) = store_back {
                                 PINNED_POOL
                                     .lock()
@@ -3077,7 +3260,7 @@ impl Pool<'_> {
                         }
 
                         if ipc_present == DEVICE_ASCEND {
-                            if tensor_device != "cpu" {
+                            if !(tensor_device == "cpu" || is_npu) {
                                 if let Some(slot_data) = store_back {
                                     PINNED_POOL
                                         .lock()
@@ -3085,14 +3268,19 @@ impl Pool<'_> {
                                         .insert(counter, slot_data);
                                 }
                                 return Err(eyre::eyre!(
-                                    "[{}] write_tensor_pool: Ascend IPC pool requires CPU source, got `{}`",
+                                    "[{}] write_tensor_pool: Ascend IPC pool requires CPU or NPU source, got `{}`",
                                     self.node_id,
                                     tensor_device
                                 ));
                             }
                             let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
-                            if let Err(e) = copy_host_to_npu_pool(py, &buffer_id, ptr_val, size) {
+                            let copy_result = if is_npu {
+                                copy_npu_to_npu_pool(py, &buffer_id, ptr_val, size)
+                            } else {
+                                copy_host_to_npu_pool(py, &buffer_id, ptr_val, size)
+                            };
+                            if let Err(e) = copy_result {
                                 if let Some(slot_data) = store_back.take() {
                                     PINNED_POOL
                                         .lock()
@@ -3100,8 +3288,9 @@ impl Pool<'_> {
                                         .insert(counter, slot_data);
                                 }
                                 return Err(eyre::eyre!(
-                                    "[{}] write_tensor_pool: CPU-to-NPU IPC copy failed: {}",
+                                    "[{}] write_tensor_pool: {}-to-NPU IPC copy failed: {}",
                                     self.node_id,
+                                    if is_npu { "NPU" } else { "CPU" },
                                     e
                                 ));
                             }
@@ -3156,9 +3345,8 @@ impl Pool<'_> {
                                 ));
                             }
                         } else if is_npu {
-                            // Ascend NPU source → CPU shmem. NPU receiver pools are
-                            // rejected at registration, so an NPU source never has
-                            // `ipc_present == 1`.
+                            // Ascend NPU source → CPU shmem. NPU→NPU is handled
+                            // above via `DEVICE_ASCEND`.
                             let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             let copy_result =
@@ -3393,7 +3581,7 @@ impl Pool<'_> {
                         let ipc_present =
                             unsafe { std::ptr::read(shmem_ptr.add(24) as *const u64) };
 
-                        if is_npu && ipc_present != DEVICE_CPU {
+                        if is_npu && ipc_present == DEVICE_CUDA {
                             return Err(eyre::eyre!(
                                 "[{}] write_tensor_pool (slow path): NPU source cannot \
                                  write to an IPC-backed CUDA pool",
@@ -3421,24 +3609,39 @@ impl Pool<'_> {
                         }
 
                         if ipc_present == DEVICE_ASCEND {
-                            if tensor_device != "cpu" {
+                            if !(tensor_device == "cpu" || is_npu) {
                                 return Err(eyre::eyre!(
                                     "[{}] write_tensor_pool (slow path): Ascend IPC pool \
-                                     requires CPU source, got `{}`",
+                                     requires CPU or NPU source, got `{}`",
                                     self.node_id,
                                     tensor_device
                                 ));
                             }
                             let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
-                            copy_host_to_npu_pool(py, &buffer_id, ptr_val, size).map_err(|e| {
-                                eyre::eyre!(
-                                    "[{}] write_tensor_pool (slow path): \
-                                     CPU-to-NPU IPC copy failed: {}",
-                                    self.node_id,
-                                    e
-                                )
-                            })?;
+                            if is_npu {
+                                copy_npu_to_npu_pool(py, &buffer_id, ptr_val, size).map_err(
+                                    |e| {
+                                        eyre::eyre!(
+                                            "[{}] write_tensor_pool (slow path): \
+                                             NPU-to-NPU IPC copy failed: {}",
+                                            self.node_id,
+                                            e
+                                        )
+                                    },
+                                )?;
+                            } else {
+                                copy_host_to_npu_pool(py, &buffer_id, ptr_val, size).map_err(
+                                    |e| {
+                                        eyre::eyre!(
+                                            "[{}] write_tensor_pool (slow path): \
+                                             CPU-to-NPU IPC copy failed: {}",
+                                            self.node_id,
+                                            e
+                                        )
+                                    },
+                                )?;
+                            }
                             unsafe {
                                 seqlock_end(gen_ptr, pre_write_gen, true);
                             }
