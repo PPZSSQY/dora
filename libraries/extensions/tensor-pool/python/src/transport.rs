@@ -1741,6 +1741,26 @@ def _npu_get_device():
         return int(dev.value)
     return -1
 
+def _npu_sync_device(device_index):
+    if device_index is None or device_index < 0:
+        return
+    _ensure_npu_runtime(device_index)
+    err = _acl.aclrtSynchronizeDevice()
+    if err != ACL_SUCCESS:
+        raise RuntimeError(f"aclrtSynchronizeDevice({device_index}) failed: {err}")
+
+def _restore_owner_device(device_index):
+    """Put ACL and torch_npu back on the card that owns sender streams."""
+    if device_index is None or device_index < 0:
+        return
+    _ensure_npu_runtime(device_index)
+    try:
+        import torch
+        if hasattr(torch, "npu"):
+            torch.npu.set_device(int(device_index))
+    except Exception:
+        pass
+
 def _npu_can_access_peer(src, dst):
     can = ctypes.c_int32(0)
     if _acl.aclrtDeviceCanAccessPeer(ctypes.byref(can), src, dst) == ACL_SUCCESS:
@@ -1831,6 +1851,7 @@ def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev, path):
         if transit_ptr:
             _acl.aclrtFreeHost(ctypes.c_void_p(transit_ptr))
         _acl.aclrtFree(d_ptr)
+        _restore_owner_device(src_dev)
         raise
     _npu_sender_buffers[pool_id] = {
         "ptr": d_ptr.value,
@@ -1841,6 +1862,7 @@ def _setup_npu_ipc_from_npu(pool_id, src, size, src_dev, dst_dev, path):
         "src_device": src_dev,
         "transit_ptr": transit_ptr,
     }
+    _restore_owner_device(src_dev)
     return handle
 
 def _npu_memcpy_npu_to_pool(pool_id, src, size):
@@ -1855,16 +1877,19 @@ def _npu_memcpy_npu_to_pool(pool_id, src, size):
     src_dev = slot.get("src_device", slot["device_index"])
     dst_dev = slot["device_index"]
     transit_ptr = slot.get("transit_ptr", 0)
-    if transit_ptr:
+    try:
+        if transit_ptr:
+            _ensure_npu_runtime(src_dev)
+            _npu_memcpy(transit_ptr, src, size, ACL_MEMCPY_DEVICE_TO_HOST, "D2H transit")
+            _ensure_npu_runtime(dst_dev)
+            _npu_memcpy(slot["ptr"], transit_ptr, size, ACL_MEMCPY_HOST_TO_DEVICE, "H2D transit")
+            return
+        if src_dev != dst_dev:
+            _npu_ensure_p2p_pair(src_dev, dst_dev)
         _ensure_npu_runtime(src_dev)
-        _npu_memcpy(transit_ptr, src, size, ACL_MEMCPY_DEVICE_TO_HOST, "D2H transit")
-        _ensure_npu_runtime(dst_dev)
-        _npu_memcpy(slot["ptr"], transit_ptr, size, ACL_MEMCPY_HOST_TO_DEVICE, "H2D transit")
-        return
-    if src_dev != dst_dev:
-        _npu_ensure_p2p_pair(src_dev, dst_dev)
-    _ensure_npu_runtime(src_dev)
-    _npu_memcpy(slot["ptr"], src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "D2D")
+        _npu_memcpy(slot["ptr"], src, size, ACL_MEMCPY_DEVICE_TO_DEVICE, "D2D")
+    finally:
+        _restore_owner_device(src_dev)
 
 def _import_npu_ipc(pool_id, handle_bytes, size, device_index):
     """Import a 65-byte Ascend IPC key and return the local device pointer."""
@@ -1897,19 +1922,27 @@ def _release_npu_sender(pool_id):
     slot = _npu_sender_buffers.pop(pool_id, None)
     if slot is None:
         return
+    dst_dev = slot["device_index"]
+    src_dev = slot.get("src_device", dst_dev)
+    transit_ptr = slot.get("transit_ptr", 0)
+    if src_dev != dst_dev:
+        _npu_sync_device(src_dev)
+    _npu_sync_device(dst_dev)
     key = ctypes.create_string_buffer(slot["key"], ACL_IPC_MEM_KEY_LEN)
     _acl.aclrtIpcMemClose(key)
-    transit_ptr = slot.get("transit_ptr", 0)
     if transit_ptr:
         _acl.aclrtFreeHost(ctypes.c_void_p(transit_ptr))
     _acl.aclrtFree(ctypes.c_void_p(slot["ptr"]))
+    _restore_owner_device(src_dev)
 
 def _release_npu_receiver(pool_id):
     slot = _npu_receiver_buffers.pop(pool_id, None)
     if slot is None:
         return
+    _npu_sync_device(slot["device_index"])
     key = ctypes.create_string_buffer(slot["key"], ACL_IPC_MEM_KEY_LEN)
     _acl.aclrtIpcMemClose(key)
+    _restore_owner_device(slot["device_index"])
 "#;
 
     let code_cstr = std::ffi::CString::new(code).map_err(|e| format!("CString: {e}"))?;
