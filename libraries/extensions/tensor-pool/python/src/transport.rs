@@ -39,9 +39,9 @@ static CUDA_HELPERS: LazyLock<std::sync::Mutex<Option<Py<PyModule>>>> =
 static ASCEND_HELPERS: LazyLock<std::sync::Mutex<Option<Py<PyModule>>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
 
-const IPC_NONE: u64 = 0;
-const IPC_CUDA: u64 = 1;
-const IPC_ASCEND: u64 = 2;
+const DEVICE_CPU: u64 = 0;
+const DEVICE_CUDA: u64 = 1;
+const DEVICE_ASCEND: u64 = 2;
 
 #[inline]
 fn is_npu_device(device: &str) -> bool {
@@ -63,7 +63,7 @@ fn npu_device_index(device: &str) -> Result<i32, String> {
 #[cfg(test)]
 mod device_tests {
     use super::{
-        IPC_ASCEND, IPC_CUDA, IPC_NONE, is_npu_device, npu_device_index, should_push_mirror,
+        DEVICE_ASCEND, DEVICE_CPU, DEVICE_CUDA, is_npu_device, npu_device_index, should_push_mirror,
     };
 
     #[test]
@@ -92,16 +92,16 @@ mod device_tests {
 
     #[test]
     fn accelerator_ipc_kinds_are_distinct() {
-        assert_eq!(IPC_NONE, 0);
-        assert_eq!(IPC_CUDA, 1);
-        assert_eq!(IPC_ASCEND, 2);
-        assert_ne!(IPC_CUDA, IPC_ASCEND);
+        assert_eq!(DEVICE_CPU, 0);
+        assert_eq!(DEVICE_CUDA, 1);
+        assert_eq!(DEVICE_ASCEND, 2);
+        assert_ne!(DEVICE_CUDA, DEVICE_ASCEND);
     }
 
     #[test]
     fn device_ipc_pools_never_push_a_shmem_payload() {
-        assert!(!should_push_mirror("pool_test_cuda", IPC_CUDA));
-        assert!(!should_push_mirror("pool_test_npu", IPC_ASCEND));
+        assert!(!should_push_mirror("pool_test_cuda", DEVICE_CUDA));
+        assert!(!should_push_mirror("pool_test_npu", DEVICE_ASCEND));
     }
 }
 
@@ -445,7 +445,7 @@ static DIRECT_POOLS: LazyLock<std::sync::Mutex<std::collections::HashSet<String>
 /// without a `machine` (no mirror) or with a same-host direct reader
 /// (DIRECT_POOLS) skip too.
 fn should_push_mirror(buffer_id: &str, ipc_present: u64) -> bool {
-    if ipc_present != IPC_NONE {
+    if ipc_present != DEVICE_CPU {
         return false;
     }
     let skip_push = {
@@ -507,18 +507,96 @@ fn rollback_local_pool(
 /// DORADMA shared-memory header layout:
 ///
 /// Offset  Size   Field
-/// 0       8      magic      — b"DORADMA\x00"
-/// 8       8      json_len   — u64 LE, metadata JSON byte length
-/// 16      8      data_off   — u64 LE, byte offset of tensor data from shmem base
-/// 24      8      ipc_flag   — 0=none, 1=CUDA IPC, 2=Ascend torch_npu IPC
-/// 32      64     ipc_handle — CUDA IPC mem handle (only valid if ipc_flag == 1)
-/// 96      8      write_gen  — u64 LE, seqlock: even = complete, odd = writing
-/// 104     152    reserved
-/// 256     N      json       — padded-to-256-byte-alignment metadata JSON
-/// 256+N   M      data       — tensor payload
+/// 0       8      magic         — b"DORADMA\x00"
+/// 8       8      json_len      — u64 LE, metadata JSON byte length
+/// 16      8      data_off      — u64 LE, byte offset of tensor data from shmem base
+/// 24      8      device_type   — 0=CPU, 1=NVIDIA/CUDA, 2=Ascend
+/// 32      72     ipc_handle    — CUDA uses 64 bytes, Ascend uses 65 bytes, rest zero
+/// 104     8      write_gen     — u64 LE, seqlock: even = complete, odd = writing
+/// 112     8      header_ver    — u64 LE, current layout is 1
+/// 120     136    reserved
+/// 256     N      json          — padded-to-256-byte-alignment metadata JSON
+/// 256+N   M      data          — tensor payload
 const DORADMA_HEADER_SIZE: usize = 256;
 const DORADMA_MAGIC: &[u8; 8] = b"DORADMA\x00";
 const DORADMA_METADATA_ALIGN: usize = 256;
+const DEVICE_TYPE_OFFSET: usize = 24;
+const IPC_HANDLE_OFFSET: usize = 32;
+const IPC_HANDLE_SLOT: usize = 72;
+const CUDA_HANDLE_LEN: usize = 64;
+const ASCEND_HANDLE_LEN: usize = 65;
+const WRITE_GEN_OFFSET: usize = 104;
+const HEADER_VERSION_OFFSET: usize = 112;
+const HEADER_VERSION: u64 = 1;
+
+unsafe fn write_header_u64_at(ptr: *mut u8, offset: usize, value: u64) {
+    let le = value.to_le_bytes();
+    unsafe { std::ptr::copy_nonoverlapping(le.as_ptr(), ptr.add(offset), 8) };
+}
+
+unsafe fn write_handle_slot(shmem_ptr: *mut u8, handle: &[u8]) {
+    unsafe {
+        std::ptr::write_bytes(shmem_ptr.add(IPC_HANDLE_OFFSET), 0, IPC_HANDLE_SLOT);
+        std::ptr::copy_nonoverlapping(
+            handle.as_ptr(),
+            shmem_ptr.add(IPC_HANDLE_OFFSET),
+            handle.len(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod header_layout_tests {
+    use super::*;
+
+    #[test]
+    fn new_header_offsets_are_aligned() {
+        assert_eq!(DEVICE_TYPE_OFFSET, 24);
+        assert_eq!(IPC_HANDLE_OFFSET, 32);
+        assert_eq!(IPC_HANDLE_SLOT, 72);
+        assert_eq!(IPC_HANDLE_OFFSET + IPC_HANDLE_SLOT, WRITE_GEN_OFFSET);
+        assert_eq!(WRITE_GEN_OFFSET, 104);
+        assert_eq!(HEADER_VERSION_OFFSET, 112);
+        assert_eq!(WRITE_GEN_OFFSET % 8, 0);
+        assert_eq!(HEADER_VERSION_OFFSET % 8, 0);
+        assert_eq!(CUDA_HANDLE_LEN, 64);
+        assert_eq!(ASCEND_HANDLE_LEN, 65);
+        const { assert!(CUDA_HANDLE_LEN <= IPC_HANDLE_SLOT) };
+        const { assert!(ASCEND_HANDLE_LEN <= IPC_HANDLE_SLOT) };
+    }
+
+    #[test]
+    fn handle_slot_pads_unused_bytes() {
+        let mut buf = [0xAAu8; 256];
+        let handle = [1u8; CUDA_HANDLE_LEN];
+        unsafe { write_handle_slot(buf.as_mut_ptr(), &handle) };
+        assert_eq!(
+            &buf[IPC_HANDLE_OFFSET..IPC_HANDLE_OFFSET + CUDA_HANDLE_LEN],
+            &handle
+        );
+        assert!(
+            buf[IPC_HANDLE_OFFSET + CUDA_HANDLE_LEN..IPC_HANDLE_OFFSET + IPC_HANDLE_SLOT]
+                .iter()
+                .all(|b| *b == 0)
+        );
+    }
+
+    #[test]
+    fn ascend_handle_uses_65_bytes_and_pads() {
+        let mut buf = [0xAAu8; 256];
+        let handle = [7u8; ASCEND_HANDLE_LEN];
+        unsafe { write_handle_slot(buf.as_mut_ptr(), &handle) };
+        assert_eq!(
+            &buf[IPC_HANDLE_OFFSET..IPC_HANDLE_OFFSET + ASCEND_HANDLE_LEN],
+            &handle
+        );
+        assert!(
+            buf[IPC_HANDLE_OFFSET + ASCEND_HANDLE_LEN..IPC_HANDLE_OFFSET + IPC_HANDLE_SLOT]
+                .iter()
+                .all(|b| *b == 0)
+        );
+    }
+}
 
 /// Crossover where pinned-DMA bandwidth overtakes pageable copy +
 /// cudaHostRegister/unregister fixed cost (~100 µs).  Determined by
@@ -776,7 +854,7 @@ enum WritePath {
 /// Classify which write path to take.
 #[inline]
 fn classify_write_path(ipc_present: u64, is_cuda: bool, transit_ptr: u64) -> WritePath {
-    if ipc_present == IPC_CUDA {
+    if ipc_present == DEVICE_CUDA {
         if is_cuda {
             if transit_ptr != 0 {
                 WritePath::GpuToGpuPoolTransit
@@ -1386,7 +1464,6 @@ fn get_ascend_helpers(py: Python<'_>) -> Result<Py<PyModule>, String> {
 
     let code = r#"
 import ctypes
-import base64
 
 _acl = ctypes.CDLL("libascendcl.so")
 
@@ -1408,17 +1485,52 @@ _acl.aclrtMemcpy.argtypes = [
     ctypes.c_int,
 ]
 
+_acl.aclrtMalloc.restype = ctypes.c_int
+_acl.aclrtMalloc.argtypes = [
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.c_size_t,
+    ctypes.c_int,
+]
+
+_acl.aclrtFree.restype = ctypes.c_int
+_acl.aclrtFree.argtypes = [ctypes.c_void_p]
+
+_acl.aclrtIpcMemGetExportKey.restype = ctypes.c_int
+_acl.aclrtIpcMemGetExportKey.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
+    ctypes.c_uint64,
+]
+
+_acl.aclrtIpcMemImportByKey.restype = ctypes.c_int
+_acl.aclrtIpcMemImportByKey.argtypes = [
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+]
+
+_acl.aclrtIpcMemClose.restype = ctypes.c_int
+_acl.aclrtIpcMemClose.argtypes = [ctypes.c_char_p]
+
 ACL_SUCCESS = 0
 # Official aclInit contract: a second call returns this and must be ignored.
 ACL_ERROR_REPEAT_INITIALIZE = 100002
 # aclrtMemcpyKind from CANN 8.x/9.x acl_rt.h.
 ACL_MEMCPY_HOST_TO_DEVICE = 1
 ACL_MEMCPY_DEVICE_TO_HOST = 2
+# aclrtMemMallocPolicy from CANN 8.x/9.x acl_rt.h.
+ACL_MEM_MALLOC_HUGE_FIRST = 0
+ACL_IPC_MEM_KEY_LEN = 65
+ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION = 0x1
+ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT = 0x0
+ACL_PAGE_SIZE = 4096
 
 _acl_ready = False
 _current_device = None
 _npu_sender_buffers = {}
-_npu_receiver_tensors = {}
+_npu_receiver_buffers = {}
 
 def _ensure_npu_runtime(device_index):
     """Initialize AscendCL once and select the tensor's NPU when it changes."""
@@ -1433,6 +1545,11 @@ def _ensure_npu_runtime(device_index):
         if err != ACL_SUCCESS:
             raise RuntimeError(f"aclrtSetDevice({device_index}) failed: {err}")
         _current_device = device_index
+
+def _aligned_ipc_size(size):
+    if size <= 0:
+        return ACL_PAGE_SIZE
+    return (size + ACL_PAGE_SIZE - 1) & ~(ACL_PAGE_SIZE - 1)
 
 def _npu_memcpy_dtoh(dst, src, size, device_index):
     """Initialize the NPU runtime, wait for pending work, then copy D2H."""
@@ -1453,82 +1570,61 @@ def _npu_memcpy_dtoh(dst, src, size, device_index):
             f"aclrtMemcpy D2H (0x{dst:x} <- 0x{src:x}, {size}B) failed: {err}"
         )
 
-def _torch_dtype(dtype_name):
-    import torch
-    name = dtype_name.removeprefix("torch.")
-    dtype = getattr(torch, name, None)
-    if dtype is None:
-        raise ValueError(f"unsupported torch dtype for Ascend IPC: {dtype_name}")
-    return dtype
-
-def _encode_optional_bytes(value):
-    if value is None:
-        return None
-    return base64.b64encode(bytes(value)).decode("ascii")
-
-def _decode_optional_bytes(value):
-    if value is None:
-        return None
-    return base64.b64decode(value.encode("ascii"))
-
-def _create_npu_ipc_buffer(pool_id, src, size, dtype_name, shape, device_index):
-    """Allocate a torch_npu tensor, copy CPU bytes into it, and export its storage."""
-    import torch
-    import torch_npu  # noqa: F401 - installs the NPU storage IPC methods
-
+def _create_npu_ipc_buffer(pool_id, src, size, device_index):
+    """Allocate NPU memory, copy the first CPU frame, and export a 65-byte IPC key."""
     _ensure_npu_runtime(device_index)
-    torch.npu.set_device(device_index)
-    tensor = torch.empty(
-        tuple(shape),
-        dtype=_torch_dtype(dtype_name),
-        device=f"npu:{device_index}",
-    )
-    if tensor.nbytes != size:
-        raise ValueError(
-            f"Ascend IPC tensor size mismatch: tensor={tensor.nbytes}, requested={size}"
-        )
+    alloc_size = _aligned_ipc_size(size)
+    d_ptr = ctypes.c_void_p()
+    err = _acl.aclrtMalloc(ctypes.byref(d_ptr), alloc_size, ACL_MEM_MALLOC_HUGE_FIRST)
+    if err != ACL_SUCCESS or not d_ptr.value:
+        raise RuntimeError(f"aclrtMalloc({alloc_size}) failed: {err}")
     err = _acl.aclrtMemcpy(
-        ctypes.c_void_p(tensor.data_ptr()),
+        d_ptr,
         size,
         ctypes.c_void_p(src),
         size,
         ACL_MEMCPY_HOST_TO_DEVICE,
     )
     if err != ACL_SUCCESS:
+        _acl.aclrtFree(d_ptr)
         raise RuntimeError(
-            f"aclrtMemcpy H2D (0x{tensor.data_ptr():x} <- 0x{src:x}, {size}B) failed: {err}"
+            f"aclrtMemcpy H2D (0x{d_ptr.value:x} <- 0x{src:x}, {size}B) failed: {err}"
         )
-
-    shared = tensor.untyped_storage()._share_npu_()
-    if len(shared) != 8:
+    key = ctypes.create_string_buffer(ACL_IPC_MEM_KEY_LEN)
+    err = _acl.aclrtIpcMemGetExportKey(
+        d_ptr,
+        alloc_size,
+        key,
+        ACL_IPC_MEM_KEY_LEN,
+        ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
+    )
+    if err != ACL_SUCCESS:
+        _acl.aclrtFree(d_ptr)
         raise RuntimeError(
-            f"torch_npu _share_npu_ returned {len(shared)} fields; expected 8"
+            f"aclrtIpcMemGetExportKey(0x{d_ptr.value:x}, {alloc_size}) failed: {err}"
         )
-    _npu_sender_buffers[pool_id] = tensor
-    return {
-        "device": int(shared[0]),
-        "handle": _encode_optional_bytes(shared[1]),
-        "size_bytes": int(shared[2]),
-        "offset_bytes": int(shared[3]),
-        "ref_counter": _encode_optional_bytes(shared[4]),
-        "ref_counter_offset": int(shared[5]),
-        "event_handle": _encode_optional_bytes(shared[6]),
-        "event_sync_required": bool(shared[7]),
+    handle = bytes(key.raw)
+    _npu_sender_buffers[pool_id] = {
+        "ptr": d_ptr.value,
+        "size": size,
+        "alloc_size": alloc_size,
+        "key": handle,
+        "device_index": device_index,
     }
+    return handle
 
 def _npu_memcpy_htod(pool_id, src, size):
-    """Overwrite an existing sender-side torch_npu IPC buffer from CPU memory."""
-    tensor = _npu_sender_buffers.get(pool_id)
-    if tensor is None:
+    """Overwrite an existing sender-side Ascend IPC buffer from CPU memory."""
+    slot = _npu_sender_buffers.get(pool_id)
+    if slot is None:
         raise RuntimeError(f"Ascend IPC sender buffer not found: {pool_id}")
-    if size > tensor.nbytes:
+    if size > slot["size"]:
         raise ValueError(
-            f"Ascend IPC write {size}B exceeds buffer capacity {tensor.nbytes}B"
+            f"Ascend IPC write {size}B exceeds buffer capacity {slot['size']}B"
         )
-    device_index = tensor.device.index or 0
-    _ensure_npu_runtime(device_index)
+    _ensure_npu_runtime(slot["device_index"])
     err = _acl.aclrtMemcpy(
-        ctypes.c_void_p(tensor.data_ptr()),
+        ctypes.c_void_p(slot["ptr"]),
         size,
         ctypes.c_void_p(src),
         size,
@@ -1536,63 +1632,50 @@ def _npu_memcpy_htod(pool_id, src, size):
     )
     if err != ACL_SUCCESS:
         raise RuntimeError(
-            f"aclrtMemcpy H2D (0x{tensor.data_ptr():x} <- 0x{src:x}, {size}B) failed: {err}"
+            f"aclrtMemcpy H2D (0x{slot['ptr']:x} <- 0x{src:x}, {size}B) failed: {err}"
         )
 
-def _import_npu_ipc_tensor(pool_id, ipc, dtype_name, shape):
-    """Import torch_npu storage metadata and rebuild a contiguous NPU tensor."""
-    import torch
-    import torch_npu  # noqa: F401 - installs _new_shared_npu
-
-    cached = _npu_receiver_tensors.get(pool_id)
+def _import_npu_ipc(pool_id, handle_bytes, size, device_index):
+    """Import a 65-byte Ascend IPC key and return the local device pointer."""
+    cached = _npu_receiver_buffers.get(pool_id)
     if cached is not None:
-        return cached
-
-    dtype = _torch_dtype(dtype_name)
-    numel = 1
-    for dim in shape:
-        if dim < 0:
-            raise ValueError(f"negative Ascend IPC tensor dimension: {shape}")
-        numel *= dim
-    expected_bytes = numel * torch.empty((), dtype=dtype).element_size()
-    if expected_bytes > int(ipc["size_bytes"]):
+        return cached["ptr"]
+    if len(handle_bytes) != ACL_IPC_MEM_KEY_LEN:
         raise ValueError(
-            f"Ascend IPC tensor requires {expected_bytes}B but storage has "
-            f"{ipc['size_bytes']}B"
+            f"Ascend IPC key must be {ACL_IPC_MEM_KEY_LEN} bytes, got {len(handle_bytes)}"
         )
-
-    args = (
-        int(ipc["device"]),
-        _decode_optional_bytes(ipc["handle"]),
-        int(ipc["size_bytes"]),
-        int(ipc["offset_bytes"]),
-        _decode_optional_bytes(ipc["ref_counter"]),
-        int(ipc["ref_counter_offset"]),
-        _decode_optional_bytes(ipc["event_handle"]),
-        bool(ipc["event_sync_required"]),
+    _ensure_npu_runtime(device_index)
+    key = ctypes.create_string_buffer(handle_bytes, ACL_IPC_MEM_KEY_LEN)
+    d_ptr = ctypes.c_void_p()
+    err = _acl.aclrtIpcMemImportByKey(
+        ctypes.byref(d_ptr),
+        key,
+        ACL_RT_IPC_MEM_IMPORT_FLAG_DEFAULT,
     )
-    torch.npu.set_device(args[0])
-    storage = torch.UntypedStorage._new_shared_npu(*args)
-    typed = torch.storage.TypedStorage(
-        wrap_storage=storage,
-        dtype=dtype,
-        _internal=True,
-    )
-    strides = []
-    running = 1
-    for dim in reversed(shape):
-        strides.append(running)
-        running *= dim
-    strides.reverse()
-    tensor = torch._utils._rebuild_tensor(typed, 0, tuple(shape), tuple(strides))
-    _npu_receiver_tensors[pool_id] = tensor
-    return tensor
+    if err != ACL_SUCCESS or not d_ptr.value:
+        raise RuntimeError(f"aclrtIpcMemImportByKey failed: {err}")
+    _npu_receiver_buffers[pool_id] = {
+        "ptr": d_ptr.value,
+        "size": size,
+        "key": bytes(handle_bytes),
+        "device_index": device_index,
+    }
+    return d_ptr.value
 
 def _release_npu_sender(pool_id):
-    _npu_sender_buffers.pop(pool_id, None)
+    slot = _npu_sender_buffers.pop(pool_id, None)
+    if slot is None:
+        return
+    key = ctypes.create_string_buffer(slot["key"], ACL_IPC_MEM_KEY_LEN)
+    _acl.aclrtIpcMemClose(key)
+    _acl.aclrtFree(ctypes.c_void_p(slot["ptr"]))
 
 def _release_npu_receiver(pool_id):
-    _npu_receiver_tensors.pop(pool_id, None)
+    slot = _npu_receiver_buffers.pop(pool_id, None)
+    if slot is None:
+        return
+    key = ctypes.create_string_buffer(slot["key"], ACL_IPC_MEM_KEY_LEN)
+    _acl.aclrtIpcMemClose(key)
 "#;
 
     let code_cstr = std::ffi::CString::new(code).map_err(|e| format!("CString: {e}"))?;
@@ -1756,7 +1839,7 @@ mod owner_guard_tests {
 }
 
 // ==================== seqlock ====================
-/// Begins a tensor-pool seqlock write at `gen_ptr` (header offset 96)
+/// Begins a tensor-pool seqlock write at `gen_ptr` (header offset 104)
 /// **if the generation is even**.  Returns the **even** pre-write
 /// generation — i.e., the generation value before the write cycle
 /// began, which is always even.
@@ -1777,7 +1860,7 @@ unsafe fn seqlock_begin_if_even(gen_ptr: *mut u64) -> u64 {
     }
 }
 
-/// Closes a tensor-pool seqlock write (header offset 96).
+/// Closes a tensor-pool seqlock write (header offset 104).
 ///
 /// Advances the generation to `pre_write_gen + 2` (even = "complete").
 /// The caller must only invoke this on a successful copy.  GPU pool write
@@ -2158,23 +2241,16 @@ impl Pool<'_> {
         header_meta.set_item("pinned_type", pinned_type)?;
         header_meta.set_item("device", &device)?;
 
-        // 【Ascend CPU → NPU】由 torch_npu 分配目标 tensor、执行首帧 H2D，
-        // 再把 storage IPC 元组编码进 JSON。张量本体留在 NPU 显存中。
+        // 【Ascend CPU → NPU】aclrtMalloc + H2D + 65 字节 IPC key，写入固定头。
+        let mut npu_handle: Option<Vec<u8>> = None;
         if receiver_is_npu {
             let device_index = npu_device_index(&device).map_err(|e| eyre::eyre!(e))?;
             let helpers = get_ascend_helpers(py).map_err(|e| eyre::eyre!(e))?;
-            let ipc = helpers
+            let handle = helpers
                 .bind(py)
                 .call_method1(
                     "_create_npu_ipc_buffer",
-                    (
-                        &buffer_id,
-                        ptr_val,
-                        size,
-                        &dtype,
-                        shape_list.clone(),
-                        device_index,
-                    ),
+                    (&buffer_id, ptr_val, size, device_index),
                 )
                 .map_err(|e| {
                     eyre::eyre!(
@@ -2182,10 +2258,31 @@ impl Pool<'_> {
                         self.node_id,
                         e
                     )
-                })?;
-            if let Err(e) = header_meta.set_item("npu_ipc", ipc) {
-                release_npu_sender(py, &buffer_id);
-                return Err(e.into());
+                })
+                .and_then(|v| {
+                    v.extract::<Vec<u8>>().map_err(|e| {
+                        eyre::eyre!(
+                            "[{}] register_tensor_pool: Ascend IPC key extract failed: {}",
+                            self.node_id,
+                            e
+                        )
+                    })
+                });
+            match handle {
+                Ok(bytes) if bytes.len() == ASCEND_HANDLE_LEN => npu_handle = Some(bytes),
+                Ok(bytes) => {
+                    release_npu_sender(py, &buffer_id);
+                    eyre::bail!(
+                        "[{}] register_tensor_pool: Ascend IPC key must be {} bytes, got {}",
+                        self.node_id,
+                        ASCEND_HANDLE_LEN,
+                        bytes.len()
+                    );
+                }
+                Err(e) => {
+                    release_npu_sender(py, &buffer_id);
+                    return Err(e);
+                }
             }
         }
 
@@ -2272,24 +2369,27 @@ impl Pool<'_> {
                 shmem_ptr.add(DORADMA_HEADER_SIZE),
                 json_len,
             );
-            std::ptr::write(
-                shmem_ptr.add(24) as *mut u64,
+            write_header_u64_at(
+                shmem_ptr,
+                DEVICE_TYPE_OFFSET,
                 if receiver_is_npu {
-                    IPC_ASCEND
+                    DEVICE_ASCEND
                 } else {
-                    IPC_NONE
+                    DEVICE_CPU
                 },
             );
-        }
-
-        // [96..104) write_gen 初值为 0（偶数 = 完整可读）
-        unsafe {
-            std::ptr::write(shmem_ptr.add(96) as *mut u64, 0u64);
+            if let Some(ref handle) = npu_handle {
+                write_handle_slot(shmem_ptr, handle);
+            } else {
+                std::ptr::write_bytes(shmem_ptr.add(IPC_HANDLE_OFFSET), 0, IPC_HANDLE_SLOT);
+            }
+            write_header_u64_at(shmem_ptr, WRITE_GEN_OFFSET, 0);
+            write_header_u64_at(shmem_ptr, HEADER_VERSION_OFFSET, HEADER_VERSION);
         }
 
         // seqlock：加到奇数，表示「正在写」，读者应重试
         unsafe {
-            let gen_ptr = shmem_ptr.add(96) as *mut u64;
+            let gen_ptr = shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64;
             let old_gen = std::ptr::read_volatile(gen_ptr);
             std::ptr::write_volatile(gen_ptr, old_gen.wrapping_add(1));
             // 保证后面的 payload 写入不会被重排到「写进行中」标记之前被读者误读
@@ -2433,22 +2533,19 @@ impl Pool<'_> {
                                             ),
                                         )
                                         .is_ok();
-                                    // 导出 64 字节 IPC 钥匙，写入 header[32..96)，并置 ipc_flag=1
+                                    // 导出 64 字节 IPC 钥匙，写入 handle 槽前 64 字节，并置 device_type=1
                                     if htod_ok
                                         && let Ok(handle) = bound
                                             .call_method1("_ipc_export", (gpu_ptr,))
                                             .and_then(|r| r.extract::<Vec<u8>>())
-                                        && handle.len() == 64
+                                        && handle.len() == CUDA_HANDLE_LEN
                                     {
                                         unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                handle.as_ptr(),
-                                                shmem_ptr.add(32),
-                                                64,
-                                            );
-                                            std::ptr::write(
-                                                shmem_ptr.add(24) as *mut u64,
-                                                IPC_CUDA,
+                                            write_handle_slot(shmem_ptr, &handle);
+                                            write_header_u64_at(
+                                                shmem_ptr,
+                                                DEVICE_TYPE_OFFSET,
+                                                DEVICE_CUDA,
                                             );
                                         }
                                         ipc_written = true;
@@ -2636,13 +2733,11 @@ impl Pool<'_> {
                 && let Ok(handle) = bound
                     .call_method1("_ipc_export", (gpu_ptr,))
                     .and_then(|r| r.extract::<Vec<u8>>())
-                && handle.len() == 64
+                && handle.len() == CUDA_HANDLE_LEN
             {
                 unsafe {
-                    // handle → [32..96)
-                    std::ptr::copy_nonoverlapping(handle.as_ptr(), shmem_ptr.add(32), 64);
-                    // ipc_present = 1 @ offset 24
-                    std::ptr::write(shmem_ptr.add(24) as *mut u64, IPC_CUDA);
+                    write_handle_slot(shmem_ptr, &handle);
+                    write_header_u64_at(shmem_ptr, DEVICE_TYPE_OFFSET, DEVICE_CUDA);
                 }
                 ipc_written = true;
             }
@@ -2676,7 +2771,7 @@ impl Pool<'_> {
 
         // ---------- 10. seqlock 收尾：奇数 → 偶数，对外宣布「首帧写完可读」----------
         unsafe {
-            let gen_ptr = shmem_ptr.add(96) as *mut u64;
+            let gen_ptr = shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64;
             let old_gen = std::ptr::read_volatile(gen_ptr);
             // Release fence 必须在完成标记写入之前（#3288）
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -2843,7 +2938,7 @@ impl Pool<'_> {
     /// discipline**: wait for the receiver to signal completion (e.g. via
     /// a `next_require` round-trip) before writing the next frame.
     ///
-    /// The seqlock at header offset 96 detects in-flight overwrites so the
+    /// The seqlock at header offset 104 detects in-flight overwrites so the
     /// reader can retry, but it does **not** prevent the overwrite itself.
     /// A writer that ignores the turn-based contract will produce torn
     /// (partially updated) data at the consumer.
@@ -2941,7 +3036,7 @@ impl Pool<'_> {
 
                         // An IPC-backed pool has no shmem payload region. Ascend
                         // NPU-to-CPU must never write into it.
-                        if is_npu && ipc_present != IPC_NONE {
+                        if is_npu && ipc_present != DEVICE_CPU {
                             if let Some(slot_data) = store_back {
                                 PINNED_POOL
                                     .lock()
@@ -2961,7 +3056,7 @@ impl Pool<'_> {
                         // its capacity is irrelevant — the GPU-buffer helpers
                         // validate `size` against the actual GPU allocation.
                         if size == 0
-                            || (ipc_present == IPC_NONE
+                            || (ipc_present == DEVICE_CPU
                                 && size > shmem_capacity.saturating_sub(data_offset))
                         {
                             tracing::warn!(
@@ -2981,7 +3076,7 @@ impl Pool<'_> {
                             return Ok(());
                         }
 
-                        if ipc_present == IPC_ASCEND {
+                        if ipc_present == DEVICE_ASCEND {
                             if tensor_device != "cpu" {
                                 if let Some(slot_data) = store_back {
                                     PINNED_POOL
@@ -2995,7 +3090,7 @@ impl Pool<'_> {
                                     tensor_device
                                 ));
                             }
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             if let Err(e) = copy_host_to_npu_pool(py, &buffer_id, ptr_val, size) {
                                 if let Some(slot_data) = store_back.take() {
@@ -3013,10 +3108,10 @@ impl Pool<'_> {
                             unsafe {
                                 seqlock_end(gen_ptr, pre_write_gen, true);
                             }
-                        } else if ipc_present == IPC_CUDA && !is_cuda {
+                        } else if ipc_present == DEVICE_CUDA && !is_cuda {
                             // Seqlock: begin (noop if still odd from a
                             // previous failed copy).
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             let mut copy_ok = true;
                             if let Ok(helpers) = get_cuda_helpers(py) {
@@ -3064,7 +3159,7 @@ impl Pool<'_> {
                             // Ascend NPU source → CPU shmem. NPU receiver pools are
                             // rejected at registration, so an NPU source never has
                             // `ipc_present == 1`.
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             let copy_result =
                                 npu_device_index(&tensor_device).and_then(|device_index| {
@@ -3099,7 +3194,7 @@ impl Pool<'_> {
                         } else if is_cuda {
                             // Seqlock: begin (noop if still odd from a
                             // previous failed copy).
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             let mut copy_ok = true;
                             if let Ok(helpers) = get_cuda_helpers(py) {
@@ -3223,7 +3318,7 @@ impl Pool<'_> {
                         } else {
                             // Seqlock: begin (noop if still odd from a
                             // previous failed GPU-to-shmem copy).
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
@@ -3298,7 +3393,7 @@ impl Pool<'_> {
                         let ipc_present =
                             unsafe { std::ptr::read(shmem_ptr.add(24) as *const u64) };
 
-                        if is_npu && ipc_present != IPC_NONE {
+                        if is_npu && ipc_present != DEVICE_CPU {
                             return Err(eyre::eyre!(
                                 "[{}] write_tensor_pool (slow path): NPU source cannot \
                                  write to an IPC-backed CUDA pool",
@@ -3312,7 +3407,7 @@ impl Pool<'_> {
                         // (ipc_present == 1), which the GPU helpers validate.
                         let shmem_len = shmem.len();
                         if size == 0
-                            || (ipc_present == IPC_NONE
+                            || (ipc_present == DEVICE_CPU
                                 && size > shmem_len.saturating_sub(data_offset))
                         {
                             tracing::warn!(
@@ -3325,7 +3420,7 @@ impl Pool<'_> {
                             return Ok(());
                         }
 
-                        if ipc_present == IPC_ASCEND {
+                        if ipc_present == DEVICE_ASCEND {
                             if tensor_device != "cpu" {
                                 return Err(eyre::eyre!(
                                     "[{}] write_tensor_pool (slow path): Ascend IPC pool \
@@ -3334,7 +3429,7 @@ impl Pool<'_> {
                                     tensor_device
                                 ));
                             }
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             copy_host_to_npu_pool(py, &buffer_id, ptr_val, size).map_err(|e| {
                                 eyre::eyre!(
@@ -3347,10 +3442,10 @@ impl Pool<'_> {
                             unsafe {
                                 seqlock_end(gen_ptr, pre_write_gen, true);
                             }
-                        } else if ipc_present == IPC_CUDA && !is_cuda {
+                        } else if ipc_present == DEVICE_CUDA && !is_cuda {
                             // Extract counter for the DMA slot from buffer_id.
                             let slow_counter = parse_pool_counter(&buffer_id);
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             let mut copy_ok = true;
                             if let (Ok(helpers), Some(c)) = (get_cuda_helpers(py), slow_counter) {
@@ -3387,7 +3482,7 @@ impl Pool<'_> {
                                 ));
                             }
                         } else if is_npu {
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             let copy_result =
                                 npu_device_index(&tensor_device).and_then(|device_index| {
@@ -3413,7 +3508,7 @@ impl Pool<'_> {
                                 ));
                             }
                         } else if is_cuda {
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             let mut copy_ok = true;
                             if let Ok(helpers) = get_cuda_helpers(py) {
@@ -3513,7 +3608,7 @@ impl Pool<'_> {
                         } else {
                             // Seqlock: begin (noop if still odd from a
                             // previous failed GPU-to-shmem copy).
-                            let gen_ptr = unsafe { shmem_ptr.add(96) as *mut u64 };
+                            let gen_ptr = unsafe { shmem_ptr.add(WRITE_GEN_OFFSET) as *mut u64 };
                             let pre_write_gen = unsafe { seqlock_begin_if_even(gen_ptr) };
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
@@ -3723,8 +3818,9 @@ impl Pool<'_> {
                         // fallback is reached when the fast path retries
                         // are exhausted, typically because the generation
                         // is stuck odd (crashed writer).
-                        let read_gen =
-                            unsafe { std::ptr::read_volatile(shmem_ptr.add(96) as *const u64) };
+                        let read_gen = unsafe {
+                            std::ptr::read_volatile(shmem_ptr.add(WRITE_GEN_OFFSET) as *const u64)
+                        };
                         if read_gen % 2 != 0 {
                             warn_missing_tensor_pool(&self.node_id, "read", &buffer_id);
                             eyre::bail!(
@@ -3942,7 +4038,7 @@ impl Pool<'_> {
     ///
     /// # Synchronization model
     ///
-    /// The seqlock (write_gen at header offset 96) guards **data-byte**
+    /// The seqlock (write_gen at header offset 104) guards **data-byte**
     /// consistency across `write_tensor_pool` overwrites — the end-of-read
     /// generation re-check detects if a write occurred mid-read.  Header
     /// fields (json_len, data_offset) are written once at registration and
@@ -4131,7 +4227,7 @@ impl Pool<'_> {
         // Verify data_offset + size fits within shared memory segment.
         // Device-IPC reads don't access the shmem data
         // region, so the size check is only required for CPU-receiver paths.
-        if ipc_present == IPC_NONE {
+        if ipc_present == DEVICE_CPU {
             // Use saturating operations to guard against corrupted/hostile
             // headers with a near-usize::MAX data_offset (overflow-safe,
             // matching the write-path checks).
@@ -4154,11 +4250,14 @@ impl Pool<'_> {
             .flatten()
             .and_then(|v| v.extract::<String>().ok());
 
-        let effective_as_npu = ipc_present == IPC_ASCEND || pinned_type.as_deref() == Some("npu");
-        let effective_as_cuda = ipc_present == IPC_CUDA || pinned_type.as_deref() == Some("cuda");
+        let effective_as_npu =
+            ipc_present == DEVICE_ASCEND || pinned_type.as_deref() == Some("npu");
+        let effective_as_cuda =
+            ipc_present == DEVICE_CUDA || pinned_type.as_deref() == Some("cuda");
 
         // Seqlock: read generation, validate stable after data access
-        let read_gen = unsafe { std::ptr::read_volatile(shmem_ptr.add(96) as *const u64) };
+        let read_gen =
+            unsafe { std::ptr::read_volatile(shmem_ptr.add(WRITE_GEN_OFFSET) as *const u64) };
         if read_gen % 2 != 0 {
             // Writer is in progress — retry (caller falls back to daemon)
             return Ok(None);
@@ -4167,8 +4266,7 @@ impl Pool<'_> {
 
         let read_ptr: u64;
 
-        let mut npu_tensor: Option<Py<PyAny>> = None;
-        if ipc_present == IPC_ASCEND {
+        if ipc_present == DEVICE_ASCEND {
             let trusted_size = GPU_BUF_SIZES
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4177,29 +4275,27 @@ impl Pool<'_> {
             if check_capacity_gpu_pool(trusted_size, None, size as u64) != CapacityCheck::Ok {
                 return Ok(None);
             }
-            let dtype: String = metadata_dict
-                .get_item("dtype")?
+            let device_name: String = metadata_dict
+                .get_item("device")?
                 .and_then(|v| v.extract::<String>().ok())
-                .unwrap_or_default();
-            let shape: Vec<i64> = metadata_dict
-                .get_item("shape")?
-                .and_then(|v| v.extract::<Vec<i64>>().ok())
-                .unwrap_or_default();
-            let ipc = metadata_dict
-                .get_item("npu_ipc")?
-                .ok_or_else(|| eyre::eyre!("Ascend IPC metadata missing `npu_ipc`"))?;
+                .unwrap_or_else(|| "npu".to_string());
+            let device_index = npu_device_index(&device_name).map_err(|e| eyre::eyre!(e))?;
+            let handle_bytes = unsafe {
+                std::slice::from_raw_parts(shmem_ptr.add(IPC_HANDLE_OFFSET), ASCEND_HANDLE_LEN)
+            };
             let helpers =
                 get_ascend_helpers(py).map_err(|e| eyre::eyre!("get_ascend_helpers: {e}"))?;
-            let tensor = helpers
+            let handle_py = PyBytes::new(py, handle_bytes);
+            read_ptr = helpers
                 .bind(py)
-                .call_method1("_import_npu_ipc_tensor", (buffer_id, ipc, &dtype, &shape))
-                .map_err(|e| eyre::eyre!("Ascend IPC import failed: {e}"))?;
-            read_ptr = tensor
-                .call_method0("data_ptr")
-                .and_then(|v| v.extract::<u64>())
-                .map_err(|e| eyre::eyre!("Ascend IPC tensor data_ptr failed: {e}"))?;
-            npu_tensor = Some(tensor.unbind());
-        } else if ipc_present == IPC_CUDA {
+                .call_method1(
+                    "_import_npu_ipc",
+                    (buffer_id, handle_py, size, device_index),
+                )
+                .map_err(|e| eyre::eyre!("Ascend IPC import failed: {e}"))?
+                .extract::<u64>()
+                .map_err(|e| eyre::eyre!("Ascend IPC pointer extract failed: {e}"))?;
+        } else if ipc_present == DEVICE_CUDA {
             // GPU DMA pool: import IPC handle once, cache GPU buffer ptr
             read_ptr = {
                 let cache = RECV_GPU_VA.lock().unwrap_or_else(|e| e.into_inner());
@@ -4239,8 +4335,12 @@ impl Pool<'_> {
                             }
                         }
                         drop(cache);
-                        let handle_bytes =
-                            unsafe { std::slice::from_raw_parts(shmem_ptr.add(32), 64) };
+                        let handle_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                shmem_ptr.add(IPC_HANDLE_OFFSET),
+                                CUDA_HANDLE_LEN,
+                            )
+                        };
                         let helpers = get_cuda_helpers(py)
                             .map_err(|e| eyre::eyre!("get_cuda_helpers: {}", e))?;
                         let bound = helpers.bind(py);
@@ -4363,7 +4463,8 @@ impl Pool<'_> {
         // generation mid-read is not detected on a weakly-ordered CPU
         // (dora-rs/dora#3288).
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        let read_gen2 = unsafe { std::ptr::read_volatile(shmem_ptr.add(96) as *const u64) };
+        let read_gen2 =
+            unsafe { std::ptr::read_volatile(shmem_ptr.add(WRITE_GEN_OFFSET) as *const u64) };
         if read_gen2 != read_gen {
             return Ok(None);
         }
@@ -4400,9 +4501,6 @@ impl Pool<'_> {
         dict.set_item("dtype", dtype)?;
         dict.set_item("shape", shape)?;
         dict.set_item("device", device)?;
-        if let Some(tensor) = npu_tensor {
-            dict.set_item("_tensor", tensor)?;
-        }
 
         // A successful fast-path read means the pool is alive.  Clear
         // any stale tombstone so that the fast path re-engages after a
