@@ -33,12 +33,21 @@ python -c "import torch; assert torch.cuda.is_available()"
 - `cuda2cpu.yml` — positive throughput test for CUDA sender → CPU receiver.
 - `npu2cpu.yml` — single-machine Ascend NPU sender → CPU receiver (requires
   `torch_npu`, CANN 8.x/9.x, and `libascendcl.so`).
+- `npu2cpu_cross.yml` — Ascend analog of `cuda2cpu_cross.yml`: NPU sender on
+  machine A, CPU receiver on machine B (D2H on A, then the CPU mirror path).
+- `cpu2npu_cross.yml` — Ascend analog of `cpu2cuda_cross.yml`: CPU sender on A,
+  NPU receiver on B (host mirror, then H2D on B).
+- `npu2npu_cross.yml` — Ascend analog of `cuda2cuda_cross.yml`: NPU on A to
+  NPU on B (NPU_A → host_A → TCP → host_B → NPU_B).
 - `duplicate_free.yml` — receiver frees the same memory pool twice (CPU receiver).
 - `read_after_free.yml` — receiver frees, then reads the same memory pool again (CPU receiver).
 - `write_after_free.yml` — sender frees, then writes the same memory pool again (CPU receiver).
 - `auto_cleanup.yml` — receiver does not free; daemon cleanup is expected on shutdown (CPU receiver).
 - `cpu2cpu_cross.yml` / `cpu2cpu_cross_local.yml` — CPU→CPU cross-machine / same-host cross-daemon throughput test.
 - `cpu2cuda_cross.yml` / `cuda2cpu_cross.yml` / `cuda2cuda_cross.yml` — GPU-involved cross-machine throughput tests (CPU staging pools are created automatically on the GPU side).
+- `npu2cpu_cross.yml` — NPU sender on A, CPU receiver on B (B is CPU-only).
+- `cpu2npu_cross.yml` — CPU sender on A, NPU receiver on B (B needs Ascend).
+- `npu2npu_cross.yml` — NPU on both machines (host staging, not device IPC).
 
 ## Run
 
@@ -75,7 +84,7 @@ dora start --coordinator-port 6025 libraries/extensions/tensor-pool/examples/cpu
 
 Expected: `Average transfer throughput` ≈ **5800 MB/s** (same-host direct read; the relay baseline for the same topology is 89–113 MB/s, a 50–65× gap). This scenario is also covered by the torch-gated smoke test `smoke_local_memory_pool_cpu2cpu_cross_local`.
 
-### Cross-machine (`cpu2cpu_cross.yml` and the GPU `*_cross.yml` variants)
+### Cross-machine (`cpu2cpu_cross.yml`, `npu2cpu_cross.yml` / `cpu2npu_cross.yml` / `npu2npu_cross.yml`, and the GPU `*_cross.yml` variants)
 
 Sender on machine A, receiver on machine B, data over zenoh TCP between the two daemons.
 

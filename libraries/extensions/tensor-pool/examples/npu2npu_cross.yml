@@ -1,0 +1,32 @@
+# NPU-to-NPU cross-machine throughput test (Ascend analog of cuda2cuda_cross.yml).
+# Sender (NPU) on machine A, receiver (NPU) on machine B.
+# Data path: NPU_A → CPU_A → Zenoh TCP → CPU_B → NPU_B.
+nodes:
+  - id: sender_node
+    deploy:
+      machine: A
+      working_dir: libraries/extensions/tensor-pool/examples  # relative to the daemon's cwd (repo root), per the multiple-daemons convention
+    path: sender.py
+    inputs:
+      next_require: receiver_node/next_require
+    outputs:
+      - data
+    env:
+      cross_machine: "B"
+      sender_device: npu:0
+      receiver_device: npu:0
+      message_num: 100
+
+  - id: receiver_node
+    deploy:
+      machine: B
+      working_dir: libraries/extensions/tensor-pool/examples  # relative to the daemon's cwd (repo root), per the multiple-daemons convention
+    path: receiver.py
+    inputs:
+      data: sender_node/data
+    outputs:
+      - next_require
+    env:
+      sender_device: npu:0
+      receiver_device: npu:0
+      message_num: 100

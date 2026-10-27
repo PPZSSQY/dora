@@ -103,6 +103,21 @@ mod device_tests {
         assert!(!should_push_mirror("pool_test_cuda", DEVICE_CUDA));
         assert!(!should_push_mirror("pool_test_npu", DEVICE_ASCEND));
     }
+
+    /// NPU→CPU (and CUDA→CPU) cross-machine pools store the frame in the
+    /// host data region (`device_type=0`). The daemon can therefore mirror
+    /// those bytes; only device-IPC pools skip the push.
+    #[test]
+    fn host_payload_pools_are_eligible_to_push_mirror() {
+        assert!(should_push_mirror("pool_npu2cpu_cross", DEVICE_CPU));
+    }
+
+    #[test]
+    fn mirror_device_strings_count_as_npu_pinned_type() {
+        assert!(is_npu_device("npu"));
+        assert!(is_npu_device("npu:0"));
+        assert!(!is_npu_device("cuda:0"));
+    }
 }
 
 /// A random `u64` seed derived from the standard library's `RandomState`,
@@ -425,6 +440,20 @@ unsafe impl Send for RecvGpuHtodSlot {}
 unsafe impl Sync for RecvGpuHtodSlot {}
 
 static RECV_GPU_HTOD: LazyLock<std::sync::Mutex<HashMap<String, RecvGpuHtodSlot>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Receiver-side HtoD staging for cross-machine NPU pools.
+/// Separate from `_npu_receiver_buffers` (those are IPC imports and
+/// `aclrtIpcMemClose` on free). These pointers come from `aclrtMalloc`.
+struct RecvNpuHtodSlot {
+    _shmem: shared_memory_extended::Shmem,
+    npu_buf: u64,
+    npu_buf_size: u64,
+}
+unsafe impl Send for RecvNpuHtodSlot {}
+unsafe impl Sync for RecvNpuHtodSlot {}
+
+static RECV_NPU_HTOD: LazyLock<std::sync::Mutex<HashMap<String, RecvNpuHtodSlot>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Pools registered without a `machine` — they have no mirror on another
@@ -1630,6 +1659,7 @@ _acl_ready = False
 _current_device = None
 _npu_sender_buffers = {}
 _npu_receiver_buffers = {}
+_npu_htod_buffers = {}
 _p2p_enabled_pairs = set()
 
 def _ensure_npu_runtime(device_index):
@@ -1962,6 +1992,52 @@ def _release_npu_receiver(pool_id):
     key = ctypes.create_string_buffer(slot["key"], ACL_IPC_MEM_KEY_LEN)
     _acl.aclrtIpcMemClose(key)
     _restore_owner_device(slot["device_index"])
+
+def _get_npu_htod_buf(pool_id, size, device_index):
+    """Receiver-side staging buffer for cross-machine NPU pools (not IPC)."""
+    cached = _npu_htod_buffers.get(pool_id)
+    if cached is not None:
+        if size > cached["size"]:
+            raise ValueError(
+                f"Ascend HtoD staging {size}B exceeds buffer capacity {cached['size']}B"
+            )
+        return cached["ptr"]
+    _ensure_npu_runtime(device_index)
+    alloc_size = _aligned_ipc_size(size)
+    d_ptr = ctypes.c_void_p()
+    err = _acl.aclrtMalloc(ctypes.byref(d_ptr), alloc_size, ACL_MEM_MALLOC_HUGE_FIRST)
+    if err != ACL_SUCCESS or not d_ptr.value:
+        raise RuntimeError(f"aclrtMalloc({alloc_size}) failed: {err}")
+    _npu_htod_buffers[pool_id] = {
+        "ptr": d_ptr.value,
+        "size": size,
+        "alloc_size": alloc_size,
+        "device_index": device_index,
+    }
+    return d_ptr.value
+
+def _npu_memcpy_htod_raw(dst, src, size, device_index):
+    """Synchronous host→device copy into a receiver staging buffer."""
+    _ensure_npu_runtime(device_index)
+    err = _acl.aclrtMemcpy(
+        ctypes.c_void_p(dst),
+        size,
+        ctypes.c_void_p(src),
+        size,
+        ACL_MEMCPY_HOST_TO_DEVICE,
+    )
+    if err != ACL_SUCCESS:
+        raise RuntimeError(
+            f"aclrtMemcpy H2D (0x{dst:x} <- 0x{src:x}, {size}B) failed: {err}"
+        )
+
+def _release_npu_htod(pool_id):
+    slot = _npu_htod_buffers.pop(pool_id, None)
+    if slot is None:
+        return
+    _npu_sync_device(slot["device_index"])
+    _acl.aclrtFree(ctypes.c_void_p(slot["ptr"]))
+    _restore_owner_device(slot["device_index"])
 "#;
 
     let code_cstr = std::ffi::CString::new(code).map_err(|e| format!("CString: {e}"))?;
@@ -2006,6 +2082,43 @@ fn release_npu_receiver(py: Python<'_>, pool_id: &str) {
             .bind(py)
             .call_method1("_release_npu_receiver", (pool_id,));
     }
+}
+
+fn release_npu_htod(py: Python<'_>, pool_id: &str) {
+    if let Ok(helpers) = get_ascend_helpers(py) {
+        let _ = helpers
+            .bind(py)
+            .call_method1("_release_npu_htod", (pool_id,));
+    }
+}
+
+fn npu_htod_buf(
+    py: Python<'_>,
+    pool_id: &str,
+    size: usize,
+    device_index: i32,
+) -> Result<u64, String> {
+    let helpers = get_ascend_helpers(py)?;
+    helpers
+        .bind(py)
+        .call_method1("_get_npu_htod_buf", (pool_id, size, device_index))
+        .and_then(|v| v.extract::<u64>())
+        .map_err(|e| format!("Ascend HtoD staging alloc failed: {e}"))
+}
+
+fn copy_host_to_npu_htod(
+    py: Python<'_>,
+    dst: u64,
+    src: u64,
+    size: usize,
+    device_index: i32,
+) -> Result<(), String> {
+    let helpers = get_ascend_helpers(py)?;
+    helpers
+        .bind(py)
+        .call_method1("_npu_memcpy_htod_raw", (dst, src, size, device_index))
+        .map(|_| ())
+        .map_err(|e| format!("AscendCL CPU-to-NPU staging copy failed: {e}"))
 }
 
 fn copy_host_to_npu_pool(
@@ -2322,6 +2435,14 @@ impl Pool<'_> {
                 let _ = bound.call_method1("_free_gpu_buf", (&buffer_id,));
                 // slot._shmem drops here -> munmap
             }
+            if RECV_NPU_HTOD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&buffer_id)
+                .is_some()
+            {
+                release_npu_htod(py, &buffer_id);
+            }
             GPU_BUF_SIZES
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2449,7 +2570,8 @@ impl Pool<'_> {
         let receiver_is_npu = is_npu_device(&device);
         let receiver_is_accelerator = receiver_is_cuda || receiver_is_npu;
         let cross_machine = machine.is_some();
-        // Ascend 设备 IPC：单机 CPU→NPU / NPU→NPU；跨机仍不支持。
+        // Ascend 设备 IPC：单机 CPU→NPU / NPU→NPU。
+        // 跨机 NPU 接收端不走 IPC（句柄不能跨主机），改走主机数据区 + 对端 H2D。
         if receiver_is_npu && !(tensor_device == "cpu" || is_npu) {
             eyre::bail!(
                 "Ascend NPU IPC requires a CPU or NPU source; \
@@ -2460,12 +2582,6 @@ impl Pool<'_> {
             eyre::bail!(
                 "Ascend NPU source currently supports NPU-to-CPU or NPU-to-NPU; \
                  receiver `{device}` is not supported for NPU source `{tensor_device}`"
-            );
-        }
-        if receiver_is_npu && cross_machine {
-            eyre::bail!(
-                "Ascend NPU IPC is single-machine only; \
-                 cross-machine receiver `{device}` is not implemented"
             );
         }
         // 是否跨机注册：目标机上会建 mirror；跨机 GPU 池不走 IPC（句柄不能跨主机），
@@ -2541,9 +2657,10 @@ impl Pool<'_> {
         header_meta.set_item("pinned_type", pinned_type)?;
         header_meta.set_item("device", &device)?;
 
-        // 【Ascend】aclrtMalloc 接收卡池缓冲 + 首帧拷贝 + 65 字节 IPC key。
+        // 【Ascend】同机：aclrtMalloc 接收卡池缓冲 + 首帧拷贝 + 65 字节 IPC key。
+        // 跨机：IPC 不能跨主机，不建设备池，payload 走 shmem 数据区。
         let mut npu_handle: Option<Vec<u8>> = None;
-        if receiver_is_npu {
+        if receiver_is_npu && !cross_machine {
             let device_index = npu_device_index(&device).map_err(|e| eyre::eyre!(e))?;
             let helpers = get_ascend_helpers(py).map_err(|e| eyre::eyre!(e))?;
             let handle = if is_npu {
@@ -2712,7 +2829,7 @@ impl Pool<'_> {
             write_header_u64_at(
                 shmem_ptr,
                 DEVICE_TYPE_OFFSET,
-                if receiver_is_npu {
+                if receiver_is_npu && !cross_machine {
                     DEVICE_ASCEND
                 } else {
                     DEVICE_CPU
@@ -2944,8 +3061,9 @@ impl Pool<'_> {
             sender_device_idx
         };
 
-        // 同机 CUDA 接收端的 shmem 只有 header，没有 IPC 句柄则池不可用
-        let mut ipc_written = receiver_is_npu;
+        // 同机 CUDA / 同机 NPU 接收端的 shmem 只有 header，没有 IPC 句柄则池不可用。
+        // 跨机 NPU 接收端走主机数据区，device_type=0，不算 IPC。
+        let mut ipc_written = receiver_is_npu && !cross_machine;
 
         if receiver_is_cuda
             && !cross_machine
@@ -3099,7 +3217,7 @@ impl Pool<'_> {
                 tensor_device
             );
         }
-        if receiver_is_npu && !ipc_written {
+        if receiver_is_npu && !cross_machine && !ipc_written {
             shmem.set_owner(true);
             release_npu_sender(py, &buffer_id);
             eyre::bail!(
@@ -4335,6 +4453,14 @@ impl Pool<'_> {
                 let _ = bound.call_method1("_free_gpu_buf", (&buffer_id,));
                 // slot._shmem drops here -> munmap
             }
+            if RECV_NPU_HTOD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&buffer_id)
+                .is_some()
+            {
+                release_npu_htod(py, &buffer_id);
+            }
         }
         RECV_CPU_SHMEM
             .lock()
@@ -4609,10 +4735,14 @@ impl Pool<'_> {
             .flatten()
             .and_then(|v| v.extract::<String>().ok());
 
+        // Mirror JSON stores the receiver device string (`npu:0` / `cuda:0`),
+        // not the short `npu` / `cuda` token written on the sender's local header.
         let effective_as_npu =
-            ipc_present == DEVICE_ASCEND || pinned_type.as_deref() == Some("npu");
-        let effective_as_cuda =
-            ipc_present == DEVICE_CUDA || pinned_type.as_deref() == Some("cuda");
+            ipc_present == DEVICE_ASCEND || pinned_type.as_deref().is_some_and(is_npu_device);
+        let effective_as_cuda = ipc_present == DEVICE_CUDA
+            || pinned_type
+                .as_deref()
+                .is_some_and(|s| s == "cuda" || s.starts_with("cuda:"));
 
         // Seqlock: read generation, validate stable after data access
         let read_gen =
@@ -4795,6 +4925,54 @@ impl Pool<'_> {
                     )
                     .map_err(|e| eyre::eyre!("HtoD staging copy: {}", e))?;
             }
+        } else if effective_as_npu {
+            // Cross-machine NPU pool: ipc_present == 0, pinned_type is
+            // `npu` / `npu:N`. Payload is host bytes in the mirror; stage
+            // into a local aclrtMalloc buffer. Do not import an IPC key.
+            let npu_device_name = metadata_dict
+                .get_item("device")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<String>().ok())
+                .filter(|s| is_npu_device(s))
+                .or_else(|| pinned_type.clone().filter(|s| is_npu_device(s)))
+                .unwrap_or_else(|| "npu".to_string());
+            let device_index = npu_device_index(&npu_device_name).map_err(|e| eyre::eyre!(e))?;
+            read_ptr = {
+                let trusted = GPU_BUF_SIZES.lock().unwrap_or_else(|e| e.into_inner());
+                match check_capacity_gpu_pool(trusted.get(buffer_id).copied(), None, size as u64) {
+                    CapacityCheck::Ok => {}
+                    _ => return Ok(None),
+                }
+                let cache = RECV_NPU_HTOD.lock().unwrap_or_else(|e| e.into_inner());
+                match cache.get(buffer_id) {
+                    Some(slot) if slot.npu_buf_size >= size as u64 => slot.npu_buf,
+                    Some(_) => return Ok(None),
+                    None => {
+                        drop(cache);
+                        let npu_buf = npu_htod_buf(py, buffer_id, size, device_index)
+                            .map_err(|e| eyre::eyre!(e))?;
+                        let mut cache = RECV_NPU_HTOD.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.insert(
+                            buffer_id.to_string(),
+                            RecvNpuHtodSlot {
+                                _shmem: shmem,
+                                npu_buf,
+                                npu_buf_size: size as u64,
+                            },
+                        );
+                        npu_buf
+                    }
+                }
+            };
+            copy_host_to_npu_htod(
+                py,
+                read_ptr,
+                shmem_ptr as u64 + data_offset as u64,
+                size,
+                device_index,
+            )
+            .map_err(|e| eyre::eyre!("NPU HtoD staging copy: {e}"))?;
         } else {
             // On the first read the fresh mapping is cached; on subsequent
             // reads the fresh mapping is dropped and the returned pointer

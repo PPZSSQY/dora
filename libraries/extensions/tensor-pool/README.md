@@ -6,10 +6,10 @@ frame does not travel through the normal message path every tick. CUDA sources
 and sinks get DMA and IPC paths on top; a CPU-only machine gets plain shared
 memory.
 
-Ascend support is currently limited to the **single-machine NPU-to-CPU** path.
-An NPU tensor created by `torch_npu` is copied synchronously into the existing
-shared-memory data region through AscendCL. CPU-to-NPU, NPU-to-NPU, Ascend IPC,
-and cross-machine Ascend paths are not implemented yet.
+Ascend support covers the single-machine NPU↔CPU and NPU↔NPU paths, and
+cross-machine **NPU→CPU**, **CPU→NPU**, and **NPU→NPU**. Cross-machine NPU
+receivers stage through the host mirror (D2H on the sender if needed, TCP,
+then H2D on the receiver). Device IPC stays single-machine.
 
 ## ⚠️ Not covered by dora's 1.0 compatibility guarantees
 
