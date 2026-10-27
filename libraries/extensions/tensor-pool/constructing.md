@@ -1,4 +1,4 @@
-cd /workspace/tensorpool-ascend/dora
+cd ~/workspace/tensorpool-ascend/dora
 cd libraries/extensions/tensor-pool
 source .venv/bin/activate
 
@@ -7,20 +7,51 @@ source .venv/bin/activate
 deactivate
 
 # Python 绑定（含 NPU→CPU 传输）
-cd /workspace/tensorpool-ascend/dora
+cd ~/workspace/tensorpool-ascend/dora
 maturin develop -m apis/python/node/Cargo.toml --features tensor-pool
 
 # CLI（dora run 用）
 
 cargo build -p dora-cli --features tensor-pool
+export PATH="$HOME/workspace/tensorpool-ascend/dora/target/debug:$PATH"
+
+dora run ~/workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool/examples/cuda_inner.yml
+
+
+ascend1
+cd /workspace/tensorpool-ascend/dora
 export PATH=/workspace/tensorpool-ascend/dora/target/debug:$PATH
+export DORA_MEMORY_POOL_CROSS_MACHINE=1
+dora coordinator --interface 199.108.54.138 --port 6025 --store memory
 
-dora run /workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool/examples/npu2npu_nop2p.yml
+ascend2
+cd /workspace/tensorpool-ascend/dora
+source /workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool/.venv/bin/activate
+export PATH=/workspace/tensorpool-ascend/dora/target/debug:$PATH
+export DORA_MEMORY_POOL_CROSS_MACHINE=1
+dora daemon --machine-id B \
+  --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  --zenoh-listen 199.108.54.138:5456 \
+  --zenoh-no-multicast
 
+any1
+cd ~/workspace/tensorpool-ascend/dora
+source libraries/extensions/tensor-pool/.venv/bin/activate
+export PATH="$HOME/workspace/tensorpool-ascend/dora/target/debug:$PATH"
+export DORA_MEMORY_POOL_CROSS_MACHINE=1
+dora daemon --machine-id A \
+  --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  --zenoh-connect tcp/199.108.54.138:5456 \
+  --zenoh-no-multicast
 
-
-
-
+any2
+cd ~/workspace/tensorpool-ascend/dora
+source libraries/extensions/tensor-pool/.venv/bin/activate
+export PATH="$HOME/workspace/tensorpool-ascend/dora/target/debug:$PATH"
+dora build --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  libraries/extensions/tensor-pool/examples/cpu2npu_cross.yml
+dora start --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  libraries/extensions/tensor-pool/examples/cpu2npu_cross.yml --attach
 
 
 
@@ -205,14 +236,14 @@ tensor-pool/
 ## 本机环境（备忘，与逻辑无关）
 
 ```bash
-cd /workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool
+cd ~/workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool
 source .venv/bin/activate
-export PATH=/workspace/tensorpool-ascend/dora/target/debug:$PATH
+export PATH="$HOME/workspace/tensorpool-ascend/dora/target/debug:$PATH"
 ```
 
-- `.venv`：Python 依赖（含 CPU 版 torch）  
+- `.venv`：Python 依赖（含 CUDA 12.8 版 torch，对应 RTX 5060）  
 - `PATH`：让 shell 找到带 `tensor-pool` feature 编出来的 `dora`  
-- 本机无 NVIDIA CUDA；`torch.cuda.is_available()` 为假属预期  
+- 驱动为 Ubuntu 24.04 的 `nvidia-driver-595-open`；`torch.cuda.is_available()` 应为真  
 
 ---
 
