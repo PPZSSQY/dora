@@ -54,10 +54,13 @@ dora build --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
 dora start --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
   libraries/extensions/tensor-pool/examples/cpu2npu_cross.yml --attach
 
+speed test
+cd /workspace/tensorpool-ascend/dora
+python3 libraries/extensions/tensor-pool/examples/tcp_bw.py server --bind 0.0.0.0 --port 17410
 
 
-
-
+cd ~/workspace/tensorpool-ascend/dora
+python3 libraries/extensions/tensor-pool/examples/tcp_bw.py client --host 199.108.54.138 --port 17410
 
 
 
