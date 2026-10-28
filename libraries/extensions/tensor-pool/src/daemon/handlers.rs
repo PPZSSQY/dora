@@ -472,11 +472,10 @@ impl PoolState {
                     .tensor_pool
                     .is_cross(&dataflow_id.to_string(), &shared_memory_id)
                 {
-                    // Reply must stay byte-identical to the forwarded
-                    // path below (Result(Ok(()))) — the node cannot
-                    // distinguish a gated local write from a forwarded
-                    // cross-machine one.
-                    let _ = reply_sender.send(DaemonReply::Result(Ok(())));
+                    // Same success reply as the forwarded path: an
+                    // ExtensionReply of NodeResponse::Ok. A bare
+                    // Result(Ok(())) is rejected by extension_request.
+                    let _ = reply_sender.send(node_reply(&NodeResponse::Ok));
                     return Ok(());
                 }
                 // Shared-memory-reference write: the node sends only
@@ -1071,7 +1070,7 @@ impl PoolState {
                 // completed (drop_key returns None).
                 let ext_key = shared_memory_id.clone();
                 svc.extension_drop_notify(dataflow_id, NAMESPACE, &ext_key);
-                let _ = reply_sender.send(DaemonReply::Result(Ok(())));
+                let _ = reply_sender.send(node_reply(&NodeResponse::Ok));
             }
         }
         Ok(())

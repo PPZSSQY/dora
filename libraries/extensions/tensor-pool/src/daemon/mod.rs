@@ -353,7 +353,10 @@ mod cross_pool_write_tests {
         // The seq-matched ack resolves exactly its own pending reply.
         assert!(resolve_cross_write_ack(df, pool.clone(), 1, true, None));
         match rx1.try_recv() {
-            Ok(DaemonReply::Result(Ok(()))) => {}
+            Ok(DaemonReply::ExtensionReply { payload })
+                if postcard::from_bytes::<NodeResponse>(&payload).ok() == Some(NodeResponse::Ok) =>
+            {
+            }
             other => panic!("seq-1 ack resolved the wrong reply: {other:?}"),
         }
         // seq 2 is untouched by the seq-1 ack.
@@ -937,7 +940,10 @@ mod cross_pool_write_tests {
 
         // The pending write's reply is resolved by the zenoh-delivered ack.
         match rx.await {
-            Ok(DaemonReply::Result(Ok(()))) => {}
+            Ok(DaemonReply::ExtensionReply { payload })
+                if postcard::from_bytes::<NodeResponse>(&payload).ok() == Some(NodeResponse::Ok) =>
+            {
+            }
             other => panic!("pending reply not resolved by the zenoh ack: {other:?}"),
         }
     }

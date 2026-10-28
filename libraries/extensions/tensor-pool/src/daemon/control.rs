@@ -222,12 +222,17 @@ pub(crate) fn resolve_cross_write_ack(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&(dataflow_id, shared_memory_id, seq))
     {
-        let result = if ok {
-            Ok(())
+        // The node receives this through `extension_request`, which only
+        // accepts `ExtensionReply`. `Result(Ok(()))` is a successful write
+        // that the node logs as "unexpected ExtensionRequest reply".
+        let reply = if ok {
+            super::handlers::node_reply(&NodeResponse::Ok)
         } else {
-            Err(error.unwrap_or_else(|| "remote mirror write failed".to_string()))
+            DaemonReply::Result(Err(
+                error.unwrap_or_else(|| "remote mirror write failed".to_string()),
+            ))
         };
-        let _ = tx.send(DaemonReply::Result(result));
+        let _ = tx.send(reply);
         true
     } else {
         false
@@ -356,6 +361,7 @@ mod cross_write_failover_tests {
     };
     use dora_message::DataflowId;
     use dora_message::daemon_to_node::DaemonReply;
+    use crate::protocol::NodeResponse;
 
     #[test]
     fn failover_rekey_drops_stale_direct_ack_and_resolves_via_relay() {
@@ -409,7 +415,12 @@ mod cross_write_failover_tests {
         ));
         let result = rx.blocking_recv().expect("node reply delivered");
         assert!(
-            matches!(result, DaemonReply::Result(Ok(()))),
+            matches!(
+                result,
+                DaemonReply::ExtensionReply { ref payload }
+                    if postcard::from_bytes::<NodeResponse>(payload).ok()
+                        == Some(NodeResponse::Ok)
+            ),
             "node must see the relay's success, not the stale direct failure"
         );
     }

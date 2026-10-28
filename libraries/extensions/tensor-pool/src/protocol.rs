@@ -48,7 +48,7 @@ pub enum NodeRequest {
 }
 
 /// The reply to a [`NodeRequest`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeResponse {
     Ok,
     Error(String),

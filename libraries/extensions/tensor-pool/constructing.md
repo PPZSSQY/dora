@@ -34,6 +34,7 @@ dora daemon --machine-id B \
   --zenoh-listen 199.108.54.138:5456 \
   --zenoh-no-multicast
 
+
 any1
 cd ~/workspace/tensorpool-ascend/dora
 source libraries/extensions/tensor-pool/.venv/bin/activate
