@@ -19,7 +19,7 @@ nodes:
       cross_machine: "B"
       sender_device: cpu
       receiver_device: npu:0
-      message_num: 100
+      message_num: 10
 
   - id: receiver_node
     deploy:
@@ -33,4 +33,4 @@ nodes:
     env:
       sender_device: cpu
       receiver_device: npu:0
-      message_num: 100
+      message_num: 10
