@@ -1,11 +1,12 @@
 # NPU-to-CPU cross-machine throughput test (Ascend analog of cuda2cpu_cross.yml).
 # Sender (NPU) on machine A, receiver (CPU) on machine B.
 # Payload is D2H into A's /dev/shm, then the existing CPU mirror/TCP path.
+# Absolute working_dir: cross-machine spawn does not use the repo root.
 nodes:
   - id: sender_node
     deploy:
       machine: A
-      working_dir: libraries/extensions/tensor-pool/examples  # relative to the daemon's cwd (repo root), per the multiple-daemons convention
+      working_dir: /workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool/examples
     path: sender.py
     inputs:
       next_require: receiver_node/next_require
@@ -15,12 +16,12 @@ nodes:
       cross_machine: "B"
       sender_device: npu:0
       receiver_device: cpu
-      message_num: 100
+      message_num: 10
 
   - id: receiver_node
     deploy:
       machine: B
-      working_dir: libraries/extensions/tensor-pool/examples  # relative to the daemon's cwd (repo root), per the multiple-daemons convention
+      working_dir: /home/aphrora/workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool/examples
     build: pip install torch --extra-index-url https://download.pytorch.org/whl/cpu numpy tqdm
     path: receiver.py
     inputs:
@@ -30,4 +31,4 @@ nodes:
     env:
       sender_device: npu:0
       receiver_device: cpu
-      message_num: 100
+      message_num: 10

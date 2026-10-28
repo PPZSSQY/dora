@@ -54,6 +54,42 @@ dora build --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
 dora start --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
   libraries/extensions/tensor-pool/examples/cpu2npu_cross.yml --attach
 
+# npu2cpu：昇腾是 A（发送），笔记本是 B（接收）。先停掉上面的 A/B daemon 再开。
+npu2cpu-ascend1
+cd /workspace/tensorpool-ascend/dora
+export PATH=/workspace/tensorpool-ascend/dora/target/debug:$PATH
+export DORA_MEMORY_POOL_CROSS_MACHINE=1
+dora coordinator --interface 199.108.54.138 --port 6025 --store memory
+
+npu2cpu-ascend2
+cd /workspace/tensorpool-ascend/dora
+source /workspace/tensorpool-ascend/dora/libraries/extensions/tensor-pool/.venv/bin/activate
+export PATH=/workspace/tensorpool-ascend/dora/target/debug:$PATH
+export DORA_MEMORY_POOL_CROSS_MACHINE=1
+dora daemon --machine-id A \
+  --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  --zenoh-listen 199.108.54.138:5456 \
+  --zenoh-no-multicast
+
+npu2cpu-any1
+cd ~/workspace/tensorpool-ascend/dora
+source libraries/extensions/tensor-pool/.venv/bin/activate
+export PATH="$HOME/workspace/tensorpool-ascend/dora/target/debug:$PATH"
+export DORA_MEMORY_POOL_CROSS_MACHINE=1
+dora daemon --machine-id B \
+  --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  --zenoh-connect tcp/199.108.54.138:5456 \
+  --zenoh-no-multicast
+
+npu2cpu-any2
+cd ~/workspace/tensorpool-ascend/dora
+source libraries/extensions/tensor-pool/.venv/bin/activate
+export PATH="$HOME/workspace/tensorpool-ascend/dora/target/debug:$PATH"
+dora build --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  libraries/extensions/tensor-pool/examples/npu2cpu_cross.yml
+dora start --coordinator-addr 199.108.54.138 --coordinator-port 6025 \
+  libraries/extensions/tensor-pool/examples/npu2cpu_cross.yml --attach
+
 speed test
 cd /workspace/tensorpool-ascend/dora
 python3 libraries/extensions/tensor-pool/examples/tcp_bw.py server --bind 0.0.0.0 --port 17410
