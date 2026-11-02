@@ -146,7 +146,7 @@ nodes:
       - result
 ```
 
-Parameters are also injected as environment variables (`PARAM_SPEED`, `PARAM_MODE`) into every node inside the module.
+Parameters are also injected as environment variables (`PARAM_SPEED`, `PARAM_MODE`) into every node inside the module, overriding a node's own `env:` entry of the same name.
 
 ## Expansion Rules
 
@@ -154,7 +154,7 @@ Parameters are also injected as environment variables (`PARAM_SPEED`, `PARAM_MOD
 2. Prefix all internal node IDs with `{module_id}.` (e.g., `nav_stack.planner`)
 3. Replace `_mod/port_name` references with the actual sources from the parent's input map
 4. Rewrite internal cross-references (e.g., `planner/path` becomes `nav_stack.planner/path`)
-5. Map module-declared outputs to direct child outputs, so `nav_stack/cmd_vel` resolves to `nav_stack.controller/cmd_vel`. A direct child may be a standard node, a runtime `operator:`/`operators:` node, a legacy `custom:` node, or a nested module. For an output produced by one operator of a multi-operator `operators:` node, the resolved reference keeps the operator segment that runtime nodes require: `nav_stack/cmd_vel` resolves to `nav_stack.runtime/controller/cmd_vel`
+5. Map module-declared outputs to direct child outputs, so `nav_stack/cmd_vel` resolves to `nav_stack.controller/cmd_vel`. A direct child may be a standard node, a runtime `operator:`/`operators:` node, a legacy `custom:` node, or a nested module. For an output produced by the operator of an `operators:` node, the resolved reference keeps the operator segment that runtime nodes require: `nav_stack/cmd_vel` resolves to `nav_stack.runtime/controller/cmd_vel`
 6. Replace the module node with the expanded flat nodes
 7. Substitute `params:` values in `args:` fields and inject as env vars
 
@@ -195,6 +195,14 @@ Only outputs declared by a nested module are visible to its parent. A parent
 module can wire or re-export `inner/processed` from the example above because
 `processed` is listed in `inner_module.yml`'s `module.outputs`; it cannot reach
 private outputs produced by nodes inside `inner_module.yml`.
+
+Params passed to the outer module reach the nodes of every nested module, in
+`args:` and as env vars, and override an inner node's own `env: PARAM_<KEY>`
+default just as they do for a direct child. A nested module node can set its
+own `params:`, which take precedence over the outer ones, and can reference
+outer params there: `max_speed: $PARAM_SPEED` passes the outer `speed` down
+as `max_speed` as well. The original `speed` is still handed down too, so
+inner nodes see both.
 
 ## Optional Inputs
 

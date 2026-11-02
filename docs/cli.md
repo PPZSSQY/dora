@@ -220,7 +220,8 @@ nodes:
       outputs:
         - bbox
 
-  # Multiple operators sharing a runtime
+  # List form with an explicit operator id (a runtime node holds exactly
+  # one operator; outputs are referenced as runtime-node/preprocessor/<output>)
   - id: runtime-node
     operators:
       - id: preprocessor
@@ -229,12 +230,6 @@ nodes:
           raw: sensor/data
         outputs:
           - processed
-      - id: analyzer
-        shared-library: ../../target/debug/libanalyze
-        inputs:
-          data: runtime-node/preprocessor/processed
-        outputs:
-          - result
 ```
 
 ### Distributed Deployment
@@ -399,7 +394,7 @@ dora build <PATH> [OPTIONS]
 | `--offline` | false | Do not refresh the hub index over the network; cache only |
 | `--hub-override <PKG=PATH>` | — | Substitute a local checkout for a hub package (repeatable; local builds only) |
 
-**`--hub-override`:** for the node author's inner loop (UC11) — test a local checkout against a consumer dataflow without publishing. `--hub-override <namespace>/<name>=<path>` reads the manifest from `<path>`, still validates contracts, and builds + runs the node from local source instead of resolving and cloning the index pin. The same flag is accepted by `dora run`. It implies a local build (the checkout only exists on this machine), so it is rejected when combined with a remote coordinator or a distributed (`deploy:`) dataflow. Pair `dora build --hub-override …` with `dora start`, or use `dora run --hub-override …` directly.
+**`--hub-override`:** for the node author's inner loop (UC11) — test a local checkout against a consumer dataflow without publishing. `--hub-override <namespace>/<name>=<path>` reads the manifest from `<path>` (its `namespace` and `name` must match `<namespace>/<name>`, or the build fails), still validates contracts, and builds + runs the node from local source instead of resolving and cloning the index pin. The same flag is accepted by `dora run`. It implies a local build (the checkout only exists on this machine), so it is rejected when combined with a remote coordinator (`--coordinator-addr`/`--coordinator-port` or `DORA_COORDINATOR_ADDR`/`DORA_COORDINATOR_PORT`) or a distributed (`deploy:`) dataflow, unless `--local` forces a fully local build. Pair `dora build --hub-override …` with `dora start`, or use `dora run --hub-override …` directly.
 
 **Type checking:** After expanding modules, `build` runs the same type checks as `validate`. Warnings are printed by default; use `--strict-types` (or set `strict_types: true` in the YAML) to fail the build on type mismatches. User-defined types in a `types/` directory next to the dataflow are loaded automatically.
 
@@ -536,6 +531,34 @@ dora replay <FILE> [OPTIONS]
 | `--loop` | false | Loop the recording |
 | `--replace <NODE_IDS>` | all recorded | Comma-separated nodes to replace |
 | `--output-yaml <PATH>` | | Write modified YAML without running (dry run) |
+
+#### `dora recording export`
+
+Convert a recorded `.drec` file to MCAP (Apache Arrow IPC encoding). Sinks like Foxglove display plain arrow-ipc channels but do not render them natively.
+
+```
+dora recording export <RECORDING> [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<RECORDING>` | required | Path to `.drec` recording |
+| `-o, --output <PATH>` | `<RECORDING>` with the extension replaced (`capture.drec` → `capture.mcap`) | Output MCAP file path |
+| `--topics <TOPICS>` | all | Comma-separated `node/output` topics to export |
+
+Payloads are remuxed verbatim, never decoded and re-encoded. Two limits worth
+knowing before you point a consumer at the output:
+
+- `metadata.parameters` is **not** exported. That is where image outputs carry
+  `width`/`height`/`encoding`, and where services and actions carry
+  `request_id`/`goal_id`, so an exported image topic cannot be decoded on its
+  own.
+- Chunks are uncompressed, because `mcap` is built with
+  `default-features = false`. Compress the `.mcap` afterwards if size matters.
+
+The output is written to a temporary file next to the destination and renamed
+into place only once the export completes, so a failed export never leaves a
+truncated file where a readable one used to be.
 
 ---
 

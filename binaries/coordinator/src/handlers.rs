@@ -1,5 +1,5 @@
 use crate::{
-    log_subscriber::LogSubscriber,
+    log_subscriber::{Admission, LogSubscriber},
     run::{SpawnedDataflow, resolve_daemon, spawn_dataflow},
     state::{
         self, ArchivedDataflow, CachedResult, DaemonConnection, DaemonConnections, RunningBuild,
@@ -18,7 +18,7 @@ use dora_message::{
     coordinator_to_cli::{DataflowResult, LogMessage},
     coordinator_to_daemon::{BuildDataflowNodes, DaemonCoordinatorEvent, Timestamped},
     daemon_to_coordinator::{DaemonCoordinatorReply, DataflowDaemonResult},
-    descriptor::{Descriptor, ResolvedNode},
+    descriptor::Descriptor,
 };
 use eyre::{ContextCompat, WrapErr, bail, eyre};
 use futures::future::join_all;
@@ -67,47 +67,58 @@ pub(crate) fn resolve_name(
     }
 }
 
-pub(crate) async fn send_log_message(
+/// Register `subscriber` and replay the logs buffered before it attached.
+///
+/// The backlog is replayed with [`Admission::Always`]: it is already held in
+/// memory (at most `MAX_BUFFERED_LOG_MESSAGES` lines) and a reader that just
+/// attached must get all of it, so it does not count against the
+/// connection's byte cap the way live lines do.
+pub(crate) fn attach_log_subscriber(
+    log_subscribers: &mut Vec<LogSubscriber>,
+    buffered_log_messages: &mut Vec<LogMessage>,
+    subscriber: LogSubscriber,
+    found_tx: tokio::sync::oneshot::Sender<bool>,
+) {
+    log_subscribers.push(subscriber);
+    let _ = found_tx.send(true);
+    for message in std::mem::take(buffered_log_messages) {
+        deliver_log_message(log_subscribers, &message, Admission::Always);
+    }
+}
+
+/// Forward a live log line to every subscriber without waiting.
+///
+/// This runs inline in the coordinator's event loop for every log line, so
+/// it must never wait on a reader (#3794): one connection that reads slowly
+/// would otherwise pace the whole coordinator. A connection with more than
+/// `MAX_QUEUED_LOG_BYTES` still queued misses the line and is told how many
+/// it missed with the next line it gets.
+pub(crate) fn send_log_message(log_subscribers: &mut Vec<LogSubscriber>, message: &LogMessage) {
+    deliver_log_message(log_subscribers, message, Admission::Capped);
+}
+
+/// Forward a one-off status line from the coordinator itself, such as
+/// "dataflow finished", a spawn or build-timeout error, or an orphaned
+/// dataflow waiting for its daemons.
+///
+/// Unlike [`send_log_message`] it is never dropped over the byte cap, and it
+/// carries any pending dropped-lines notice: it is often the last line the
+/// subscribers get before they are dropped with their dataflow or build.
+pub(crate) fn send_status_log_message(
     log_subscribers: &mut Vec<LogSubscriber>,
     message: &LogMessage,
 ) {
-    // Tolerate transient slowness the same way `send_topic_frames` does: a
-    // single 100 ms timeout — which happens whenever a `dora logs -f` reader
-    // stalls long enough to keep its bounded channel full during a log burst —
-    // must not permanently drop the subscription. Only close after the channel
-    // is actually gone, or after a sustained streak of timeouts.
-    const MAX_CONSECUTIVE_LOG_SEND_TIMEOUTS: usize = 100;
+    deliver_log_message(log_subscribers, message, Admission::Always);
+}
+
+fn deliver_log_message(
+    log_subscribers: &mut Vec<LogSubscriber>,
+    message: &LogMessage,
+    admission: Admission,
+) {
     for subscriber in log_subscribers.iter_mut() {
-        let send_result =
-            tokio::time::timeout(Duration::from_millis(100), subscriber.send_message(message))
-                .await;
-        match send_result {
-            // Actually enqueued — the subscriber is keeping up, clear the streak.
-            Ok(Ok(true)) => {
-                subscriber.reset_timeout_streak();
-            }
-            // Dropped by the level filter — not a delivery attempt, so leave the
-            // streak untouched (resetting here would let below-filter traffic
-            // keep a stuck subscriber alive forever).
-            Ok(Ok(false)) => {}
-            Ok(Err(_)) => {
-                subscriber.close();
-            }
-            Err(_) => {
-                let timeouts = subscriber.record_timeout();
-                if timeouts >= MAX_CONSECUTIVE_LOG_SEND_TIMEOUTS {
-                    tracing::warn!(
-                        timeouts,
-                        "closing slow log subscriber after repeated send timeouts"
-                    );
-                    subscriber.close();
-                } else {
-                    tracing::warn!(
-                        timeouts,
-                        "timed out sending log message to CLI subscriber; keeping subscription active"
-                    );
-                }
-            }
+        if subscriber.send(message, admission).is_err() {
+            subscriber.close();
         }
     }
     log_subscribers.retain(|s| !s.is_closed());
@@ -484,26 +495,35 @@ pub(crate) async fn stop_node(
 /// "multiple matching daemon connections", making `dora logs` unavailable for
 /// a node that is definitely running on one specific daemon.
 ///
-/// Archived dataflows keep no `node_to_daemon` map, so they still fall back to
-/// the machine-based derivation. Archived takes priority when a dataflow id is
-/// somehow present in both, matching the previous behavior.
+/// An archived dataflow keeps the `node_to_daemon` map it had when it
+/// finished, so a node placed by `deploy.labels` or added at runtime with
+/// `dora node add` resolves to the daemon that actually ran it. That daemon is
+/// used while it is still connected. If it has disconnected since, a daemon
+/// that re-registered for the same machine is used instead; a node that was
+/// never assigned falls back to its `deploy.machine`. Archived takes priority
+/// when a dataflow id is somehow present in both, matching the previous
+/// behavior.
 fn resolve_log_daemon_id(
     running_node_to_daemon: Option<&BTreeMap<NodeId, DaemonId>>,
-    archived_nodes: Option<&BTreeMap<NodeId, ResolvedNode>>,
+    archived: Option<&ArchivedDataflow>,
     dataflow_id: Uuid,
     node_id: &NodeId,
     daemon_connections: &DaemonConnections,
 ) -> eyre::Result<DaemonId> {
-    if let Some(nodes) = archived_nodes {
-        // `nodes` is keyed by `NodeId` and every `ResolvedNode.id` equals its map
-        // key (see `resolve_aliases_and_set_defaults_in_topology`, which also
-        // rejects duplicate ids), so a direct lookup is equivalent to — and
-        // cheaper than — scanning every entry for a matching `id`. The previous
-        // `Vec` scan additionally carried an "more than one machine" arm that the
-        // map key uniqueness made unreachable.
-        let machine_id = match nodes.get(node_id) {
-            Some(node) => node.deploy.as_ref().and_then(|d| d.machine.clone()),
-            None => bail!("No machine contains {}/{}", dataflow_id, node_id),
+    if let Some(archived) = archived {
+        let machine_id = match archived.node_to_daemon.get(node_id) {
+            Some(daemon_id) if daemon_connections.get(daemon_id).is_some() => {
+                return Ok(daemon_id.clone());
+            }
+            Some(daemon_id) => daemon_id.machine_id().map(str::to_owned),
+            // `nodes` is keyed by `NodeId` and every `ResolvedNode.id` equals its
+            // map key (see `resolve_aliases_and_set_defaults_in_topology`, which
+            // also rejects duplicate ids), so a direct lookup is equivalent to —
+            // and cheaper than — scanning every entry for a matching `id`.
+            None => match archived.nodes.get(node_id) {
+                Some(node) => node.deploy.as_ref().and_then(|d| d.machine.clone()),
+                None => bail!("No machine contains {}/{}", dataflow_id, node_id),
+            },
         };
 
         let daemon_ids: Vec<_> = match &machine_id {
@@ -557,7 +577,7 @@ pub(crate) async fn retrieve_logs(
         running_dataflows
             .get(&dataflow_id)
             .map(|d| &d.node_to_daemon),
-        archived_dataflows.get(&dataflow_id).map(|d| &d.nodes),
+        archived_dataflows.get(&dataflow_id),
         dataflow_id,
         &node_id,
         daemon_connections,
@@ -704,17 +724,16 @@ pub(crate) async fn build_dataflow(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Start `dataflow` as described by `launch`, which the returned
+/// `RunningDataflow` keeps so that `dora restart` can relaunch it the same
+/// way.
 pub(crate) async fn start_dataflow(
-    build_id: Option<BuildId>,
-    session_id: SessionId,
     dataflow: Descriptor,
-    local_working_dir: Option<PathBuf>,
+    launch: state::LaunchContext,
     name: Option<String>,
     daemon_connections: &mut DaemonConnections,
     clock: &HLC,
     uv: bool,
-    write_events_to: Option<PathBuf>,
 ) -> eyre::Result<RunningDataflow> {
     let SpawnedDataflow {
         uuid,
@@ -722,14 +741,14 @@ pub(crate) async fn start_dataflow(
         nodes,
         node_to_daemon,
     } = spawn_dataflow(
-        build_id,
-        session_id,
+        launch.build_id,
+        launch.session_id,
         dataflow.clone(),
-        local_working_dir,
+        launch.local_working_dir.clone(),
         daemon_connections,
         clock,
         uv,
-        write_events_to,
+        launch.write_events_to.clone(),
     )
     .await?;
     Ok(RunningDataflow {
@@ -766,8 +785,8 @@ pub(crate) async fn start_dataflow(
         created_at: state::now_millis(),
         store_generation: 0,
         last_recovery_attempt: BTreeMap::new(),
-        last_replay_attempt: BTreeMap::new(),
         uv,
+        launch,
         state_log_sequence: 0,
         state_log: Vec::new(),
     })
@@ -823,6 +842,7 @@ async fn destroy_daemons(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_subscriber::{LogQueue, log_queue};
     use crate::state::DaemonConnection;
     use crate::topic_subscriber::TopicSubscriber;
 
@@ -893,6 +913,67 @@ mod tests {
         )
         .expect_err("a node absent from the dataflow must error");
         assert!(err.to_string().contains("ghost"), "got: {err}");
+    }
+
+    fn archived(node_to_daemon: BTreeMap<NodeId, DaemonId>) -> ArchivedDataflow {
+        ArchivedDataflow {
+            name: None,
+            nodes: BTreeMap::new(),
+            node_to_daemon,
+            spawn_error: None,
+        }
+    }
+
+    #[test]
+    fn archived_logs_use_the_daemon_the_node_ran_on() {
+        // The node was placed on the named daemon `gpu-box` (by
+        // `deploy.labels` or `dora node add`), not by `deploy.machine`. The
+        // machine-based derivation would pick the unnamed daemon instead.
+        let node = NodeId::from("detector".to_string());
+        let gpu_box = DaemonId::new(Some("gpu-box".to_string()));
+        let unnamed = DaemonId::new(None);
+
+        let mut daemon_connections = DaemonConnections::default();
+        daemon_connections.add(gpu_box.clone(), dummy_connection());
+        daemon_connections.add(unnamed.clone(), dummy_connection());
+
+        let archived = archived(BTreeMap::from([(node.clone(), gpu_box.clone())]));
+        let resolved = resolve_log_daemon_id(
+            None,
+            Some(&archived),
+            Uuid::nil(),
+            &node,
+            &daemon_connections,
+        )
+        .expect("archived node must resolve to the daemon it ran on");
+        assert_eq!(resolved, gpu_box);
+    }
+
+    #[test]
+    fn archived_logs_follow_a_daemon_that_reconnected() {
+        // The daemon that ran the node disconnected after the dataflow
+        // finished and re-registered for the same machine under a new id. Its
+        // stale id must not be returned, and the node's `deploy.machine` (none
+        // here) must not send the request to the unnamed daemon.
+        let node = NodeId::from("detector".to_string());
+        let gone = DaemonId::new(Some("gpu-box".to_string()));
+        let reconnected = DaemonId::new(Some("gpu-box".to_string()));
+        let unnamed = DaemonId::new(None);
+
+        let mut daemon_connections = DaemonConnections::default();
+        daemon_connections.add(reconnected.clone(), dummy_connection());
+        daemon_connections.add(unnamed, dummy_connection());
+
+        let archived = archived(BTreeMap::from([(node.clone(), gone)]));
+        let resolved = resolve_log_daemon_id(
+            None,
+            Some(&archived),
+            Uuid::nil(),
+            &node,
+            &daemon_connections,
+        )
+        .expect("the reconnected daemon must be found");
+        assert_eq!(resolved, reconnected);
     }
 
     #[test]
@@ -1001,8 +1082,8 @@ mod tests {
             created_at: 0,
             store_generation: 0,
             last_recovery_attempt: BTreeMap::new(),
-            last_replay_attempt: BTreeMap::new(),
             uv: false,
+            launch: state::LaunchContext::unknown(),
             state_log_sequence: 0,
             state_log: Vec::new(),
             daemon_ack_sequence: BTreeMap::new(),
@@ -1132,7 +1213,7 @@ mod tests {
             dataflow_id: None,
             node_id: None,
             daemon_id: None,
-            // Warn passes an Info-level subscriber, so `send_message` actually
+            // Warn passes an Info-level subscriber, so `send` actually
             // enqueues rather than dropping it at the level filter.
             level: dora_message::common::LogLevel::Warn.into(),
             target: None,
@@ -1145,80 +1226,139 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn send_log_message_resets_timeout_streak_on_successful_send() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut subscriber = LogSubscriber::new(log::LevelFilter::Info, tx);
-        // Prime the counter: simulate 3 prior timeouts.
-        assert_eq!(subscriber.record_timeout(), 1);
-        assert_eq!(subscriber.record_timeout(), 2);
-        assert_eq!(subscriber.record_timeout(), 3);
-
-        let mut subscribers = vec![subscriber];
-        // A real send should succeed (channel has capacity) and reset the streak.
-        send_log_message(&mut subscribers, &test_log_message()).await;
-
-        assert!(
-            rx.try_recv().is_ok(),
-            "subscriber should receive the log message"
-        );
-        assert_eq!(subscribers.len(), 1, "subscriber must not be evicted");
-        assert_eq!(
-            subscribers[0].record_timeout(),
-            1,
-            "streak must be back to 0 after a successful send"
-        );
+    fn log_text(json: &str) -> String {
+        let event: serde_json::Value = serde_json::from_str(json).unwrap();
+        event["payload"]["message"].as_str().unwrap().to_owned()
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn send_log_message_closes_subscriber_after_100_consecutive_timeouts() {
-        // Capacity 1 + pre-filled + rx never drained = every send times out.
-        // `start_paused = true` makes tokio auto-advance through the 100 × 100ms
-        // timeouts without real wall-clock delay.
-        let (tx, _rx_never_drained) = tokio::sync::mpsc::channel(1);
-        tx.send("prefill".to_string()).await.unwrap();
+    /// A log line whose encoding is just over 1 MiB, so that
+    /// `MAX_QUEUED_LOG_BYTES` holds fewer than 16 of them.
+    fn big_log_message() -> LogMessage {
+        let mut message = test_log_message();
+        message.message = "x".repeat(1024 * 1024);
+        message
+    }
 
-        let mut subscribers = vec![LogSubscriber::new(log::LevelFilter::Info, tx)];
+    fn subscriber() -> (LogSubscriber, LogQueue) {
+        let (sink, queue) = log_queue();
+        (LogSubscriber::new(log::LevelFilter::Info, sink), queue)
+    }
 
-        for i in 1..=99 {
-            send_log_message(&mut subscribers, &test_log_message()).await;
-            assert_eq!(
-                subscribers.len(),
-                1,
-                "subscriber evicted prematurely at iteration {i}"
-            );
+    fn drain(queue: &mut LogQueue) -> Vec<String> {
+        std::iter::from_fn(|| queue.try_recv())
+            .map(|line| log_text(&line))
+            .collect()
+    }
+
+    /// The event loop never waits on a reader (#3794), and below the byte
+    /// cap nothing is dropped, however many lines a burst has.
+    #[test]
+    fn send_log_message_queues_a_burst_without_waiting_or_dropping() {
+        let (subscriber, mut queue) = subscriber();
+        let mut subscribers = vec![subscriber];
+        for _ in 0..10_000 {
+            send_log_message(&mut subscribers, &test_log_message());
         }
-        // 100th consecutive timeout triggers the close + retain eviction.
-        send_log_message(&mut subscribers, &test_log_message()).await;
+        assert_eq!(subscribers.len(), 1);
+        assert_eq!(drain(&mut queue).len(), 10_000);
+    }
+
+    /// Over the byte cap, live lines are dropped and counted. The next line
+    /// that fits goes out right after a notice of how many were dropped: the
+    /// notice does not take the place of that line, so a reader that drains
+    /// at all keeps getting real lines.
+    #[test]
+    fn send_log_message_drops_over_the_byte_cap_and_reports_with_the_next_line() {
+        let (subscriber, mut queue) = subscriber();
+        let mut subscribers = vec![subscriber];
+        const SENT: usize = 20;
+        for _ in 0..SENT {
+            send_log_message(&mut subscribers, &big_log_message());
+        }
+        assert_eq!(subscribers.len(), 1, "a slow reader must not be evicted");
+        let queued = drain(&mut queue).len();
         assert!(
-            subscribers.is_empty(),
-            "subscriber should be evicted after 100 consecutive timeouts"
+            queued < SENT,
+            "the cap must drop some of {SENT} 1 MiB lines"
+        );
+
+        let mut next = test_log_message();
+        next.message = "next".into();
+        send_log_message(&mut subscribers, &next);
+        let dropped = SENT - queued;
+        assert_eq!(
+            drain(&mut queue),
+            [
+                format!("dropped {dropped} log line(s) because this reader fell behind"),
+                "next".to_owned(),
+            ]
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn send_log_message_filtered_message_does_not_reset_streak() {
-        // A message dropped by the level filter is not a delivery attempt, so
-        // it must leave the timeout streak untouched — otherwise below-filter
-        // traffic could keep a stuck subscriber alive forever.
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        let mut subscriber = LogSubscriber::new(log::LevelFilter::Info, tx);
-        assert_eq!(subscriber.record_timeout(), 1);
-        assert_eq!(subscriber.record_timeout(), 2);
+    /// The notice carries `DROPPED_LOG_LINES_FIELD`, which the CLI uses to
+    /// show it past its node and pattern filters.
+    #[test]
+    fn dropped_lines_notice_carries_its_field() {
+        let (subscriber, mut queue) = subscriber();
         let mut subscribers = vec![subscriber];
-
-        // Debug is below the Info filter, so this is not delivered.
-        let mut msg = test_log_message();
-        msg.level = dora_message::common::LogLevel::Debug.into();
-        send_log_message(&mut subscribers, &msg).await;
-
-        assert_eq!(subscribers.len(), 1, "subscriber must not be evicted");
-        // Streak preserved at 2, so the next timeout yields 3 (not reset to 1).
-        assert_eq!(
-            subscribers[0].record_timeout(),
-            3,
-            "a filtered message must not reset the timeout streak"
+        for _ in 0..20 {
+            send_log_message(&mut subscribers, &big_log_message());
+        }
+        while queue.try_recv().is_some() {}
+        send_log_message(&mut subscribers, &test_log_message());
+        let notice: serde_json::Value = serde_json::from_str(&queue.try_recv().unwrap()).unwrap();
+        assert!(
+            notice["payload"]["fields"]
+                .get(dora_message::common::DROPPED_LOG_LINES_FIELD)
+                .is_some()
         );
+    }
+
+    /// A coordinator status line, often the last one before the subscribers
+    /// are dropped with their dataflow, is never dropped over the cap and
+    /// flushes a pending notice, even when the line itself is filtered.
+    #[test]
+    fn send_status_log_message_bypasses_the_cap_and_flushes_the_notice() {
+        let (subscriber, mut queue) = subscriber();
+        let mut subscribers = vec![subscriber];
+        for _ in 0..20 {
+            send_log_message(&mut subscribers, &big_log_message());
+        }
+        let mut finished = test_log_message();
+        finished.message = "dataflow finished".into();
+        send_status_log_message(&mut subscribers, &finished);
+        let lines = drain(&mut queue);
+        assert!(lines[lines.len() - 2].starts_with("dropped "));
+        assert_eq!(lines.last().unwrap(), "dataflow finished");
+
+        // Over the cap again, then a status line below the subscriber's
+        // level: the notice still goes out, the line does not.
+        for _ in 0..20 {
+            send_log_message(&mut subscribers, &big_log_message());
+        }
+        let mut debug = test_log_message();
+        debug.level = dora_message::common::LogLevel::Debug.into();
+        send_status_log_message(&mut subscribers, &debug);
+        let lines = drain(&mut queue);
+        assert!(lines.last().unwrap().starts_with("dropped "));
+    }
+
+    /// Attaching replays the whole backlog, even one larger than the byte
+    /// cap: it is already held in memory and a reader that just attached
+    /// must get all of it.
+    #[test]
+    fn attach_log_subscriber_replays_a_backlog_over_the_byte_cap() {
+        const BACKLOG: usize = 20;
+        let (subscriber, mut queue) = subscriber();
+        let (found_tx, found_rx) = tokio::sync::oneshot::channel::<bool>();
+        let mut subscribers = Vec::new();
+        let mut buffered = vec![big_log_message(); BACKLOG];
+        attach_log_subscriber(&mut subscribers, &mut buffered, subscriber, found_tx);
+
+        assert_eq!(found_rx.blocking_recv(), Ok(true));
+        assert!(buffered.is_empty(), "the backlog is handed over once");
+        assert_eq!(subscribers.len(), 1);
+        assert_eq!(drain(&mut queue).len(), BACKLOG);
     }
 
     /// A topic subscriber that got closed (its CLI went away) is evicted when

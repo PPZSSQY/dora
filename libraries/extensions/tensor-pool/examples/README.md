@@ -6,6 +6,8 @@ This example exercises Dora's pinned memory-pool transport for repeated tensor t
 
 Beyond the single-daemon scenarios, the `*_cross*.yml` dataflows exercise the **same-host multi-daemon** and **cross-machine** topologies: `register_tensor_pool(machine=...)` mirrors the pool on another daemon (same host or another machine), with zero-copy direct reads when the daemons share a host and a reliable zenoh/TCP data plane when they do not.
 
+Single-machine Ascend scenarios use the same sender and receiver. Set `sender_device` / `receiver_device` to `npu` or `npu:N`. The NPU side needs `torch_npu` and CANN; Ascend IPC stays on one machine.
+
 ## Install
 
 ```bash
@@ -24,6 +26,12 @@ For CUDA receiver scenarios (`cpu2cuda.yml`, `cuda2cpu.yml`), also verify CUDA i
 python -c "import torch; assert torch.cuda.is_available()"
 ```
 
+For Ascend scenarios, verify `torch_npu` and the NPU runtime instead. These YAMLs have no `build:` step, so `--uv` will not install CANN or `torch_npu`:
+
+```bash
+python -c "import torch_npu, torch; assert torch.npu.is_available()"
+```
+
 ## Files
 
 - `sender.py` — registers and updates a memory pool from the sender side. Reads `cross_machine` (target machine id) from the environment to switch to cross-machine registration.
@@ -31,23 +39,20 @@ python -c "import torch; assert torch.cuda.is_available()"
 - `cpu2cpu.yml` — positive throughput test for CPU sender → CPU receiver (GPU-less CI safe).
 - `cpu2cuda.yml` — positive throughput test for CPU sender → CUDA receiver.
 - `cuda2cpu.yml` — positive throughput test for CUDA sender → CPU receiver.
-- `npu2cpu.yml` — single-machine Ascend NPU sender → CPU receiver (requires
-  `torch_npu`, CANN 8.x/9.x, and `libascendcl.so`).
-- `npu2cpu_cross.yml` — Ascend analog of `cuda2cpu_cross.yml`: NPU sender on
-  machine A, CPU receiver on machine B (D2H on A, then the CPU mirror path).
-- `cpu2npu_cross.yml` — Ascend analog of `cpu2cuda_cross.yml`: CPU sender on A,
-  NPU receiver on B (host mirror, then H2D on B).
-- `npu2npu_cross.yml` — Ascend analog of `cuda2cuda_cross.yml`: NPU on A to
-  NPU on B (NPU_A → host_A → TCP → host_B → NPU_B).
+- `npu2cpu.yml` — positive throughput test for Ascend NPU sender → CPU receiver.
+- `cpu2npu.yml` — positive throughput test for CPU sender → Ascend NPU receiver.
+- `npu_inner.yml` — same-card NPU sender → NPU receiver (`npu:0` → `npu:0`).
+- `npu2npu.yml` — cross-card NPU sender → NPU receiver (`npu:0` → `npu:1`); uses peer access when the devices allow it.
+- `npu2npu_nop2p.yml` — cross-card NPU → NPU through host transit (peer access disabled).
+- `npu2cpu_cross.yml` — Ascend analog of `cuda2cpu_cross.yml`: NPU sender on machine A, CPU receiver on machine B.
+- `cpu2npu_cross.yml` — Ascend analog of `cpu2cuda_cross.yml`: CPU sender on A, NPU receiver on B (host mirror, then H2D on B).
+- `npu2npu_cross.yml` — Ascend analog of `cuda2cuda_cross.yml`: NPU on A to NPU on B through host staging (not device IPC).
 - `duplicate_free.yml` — receiver frees the same memory pool twice (CPU receiver).
 - `read_after_free.yml` — receiver frees, then reads the same memory pool again (CPU receiver).
 - `write_after_free.yml` — sender frees, then writes the same memory pool again (CPU receiver).
 - `auto_cleanup.yml` — receiver does not free; daemon cleanup is expected on shutdown (CPU receiver).
 - `cpu2cpu_cross.yml` / `cpu2cpu_cross_local.yml` — CPU→CPU cross-machine / same-host cross-daemon throughput test.
 - `cpu2cuda_cross.yml` / `cuda2cpu_cross.yml` / `cuda2cuda_cross.yml` — GPU-involved cross-machine throughput tests (CPU staging pools are created automatically on the GPU side).
-- `npu2cpu_cross.yml` — NPU sender on A, CPU receiver on B (B is CPU-only).
-- `cpu2npu_cross.yml` — CPU sender on A, NPU receiver on B (B needs Ascend).
-- `npu2npu_cross.yml` — NPU on both machines (host staging, not device IPC).
 
 ## Run
 
@@ -64,6 +69,18 @@ Expected behavior:
 - the sender and receiver print preview tensors
 - the receiver prints average throughput
 - no crash or obvious memory error occurs
+
+### Single-machine Ascend
+
+```bash
+dora run libraries/extensions/tensor-pool/examples/npu2cpu.yml
+dora run libraries/extensions/tensor-pool/examples/cpu2npu.yml
+dora run libraries/extensions/tensor-pool/examples/npu_inner.yml
+dora run libraries/extensions/tensor-pool/examples/npu2npu.yml
+dora run libraries/extensions/tensor-pool/examples/npu2npu_nop2p.yml
+```
+
+Expected behavior matches the positive throughput scenarios above. `npu2npu.yml` needs two visible NPUs. On `npu2npu_nop2p.yml` the sender prints `Ascend NPU IPC path: host transit`.
 
 ### Same-host multi-daemon (`cpu2cpu_cross_local.yml`)
 
@@ -84,9 +101,9 @@ dora start --coordinator-port 6025 libraries/extensions/tensor-pool/examples/cpu
 
 Expected: `Average transfer throughput` ≈ **5800 MB/s** (same-host direct read; the relay baseline for the same topology is 89–113 MB/s, a 50–65× gap). This scenario is also covered by the torch-gated smoke test `smoke_local_memory_pool_cpu2cpu_cross_local`.
 
-### Cross-machine (`cpu2cpu_cross.yml`, `npu2cpu_cross.yml` / `cpu2npu_cross.yml` / `npu2npu_cross.yml`, and the GPU `*_cross.yml` variants)
+### Cross-machine (`cpu2cpu_cross.yml`, Ascend `*_cross.yml`, and the GPU `*_cross.yml` variants)
 
-Sender on machine A, receiver on machine B, data over zenoh TCP between the two daemons.
+Sender on machine A, receiver on machine B, data over zenoh TCP between the two daemons. Ascend NPU receivers stage through the host mirror the same way CUDA does (D2H on the sender if needed, TCP, then H2D on the receiver); device IPC stays single-machine.
 
 **Cluster bring-up** (one daemon per machine, the coordinator can run on either):
 
@@ -134,7 +151,7 @@ dora start --coordinator-addr <rendezvous-ip> --coordinator-port 6025 libraries/
 **Known behavior** (measured numbers live in `design.md` §5):
 
 - Cross-machine pools accept tensors up to the 1 GiB registration cap. The per-frame write sends only metadata to the daemon (shared-memory reference); the daemon reads the sender's segment and forwards it, so the 64 MiB node→daemon request limit does not apply.
-- Writes are **commit-acknowledged**: `write_tensor_pool` returns only after the mirror daemon confirms the segment write, so the `send_output` notification that follows can never overtake the data (the receiver can never return a stale frame). A failed mirror write or a 120 s ack timeout fails the write loudly.
+- Writes are **commit-acknowledged**: `write_tensor_pool` returns only after the mirror daemon confirms the segment write, so the `send_output` notification that follows can never overtake the data (the receiver can never return a stale frame). A failed mirror write or the ack timeout fails the write loudly. The timeout scales with the frame size: about 50 s for a small frame, up to about 4 minutes for a 1 GiB frame on a ~5 MB/s link. A write that falls back to the zenoh relay waits until the relayed frame is out, then 30 s for its ack. The relay is allowed up to twice the direct budget, so a node blocks for at most about three direct budgets plus 30 s: roughly 11 minutes for a 1 GiB frame.
 - GPU-involved cross-machine paths stage through CPU pools automatically (GPU_A → DtoH → CPU_A → zenoh TCP → CPU_B → HtoD → GPU_B).
 - Native dora's cross-machine relay carries only small frames and hangs beyond that (Drop + express silently drops fragments when the 16-batch TX queue backs up); ROS 2 network DDS is RTT-paced on high-latency links. The pool is the only path that moves large frames over the WAN.
 - Same-host cross-daemon reads bypass the write/ack machinery entirely (`direct=true`).
@@ -172,6 +189,7 @@ Expected warnings/info:
 - The scenario is controlled through the `memory_pool_scenario` environment variable in each YAML file.
 - `cpu2cpu.yml` and the four negative-lifecycle YAMLs use CPU-only receiver (`receiver_device: cpu`) and are safe for GPU-less CI runners.
 - The CUDA receiver scenarios (`cpu2cuda.yml`, `cuda2cpu.yml`) require a working CUDA runtime.
+- The Ascend scenarios require `torch_npu` and CANN. `npu2npu.yml` and `npu2npu_nop2p.yml` need two visible NPUs. None of them run in CI.
 - The negative scenarios use a reduced message count to keep lifecycle validation short and focused.
 - When running with `--uv`, each YAML's `build:` step provisions torch (CPU-only from `download.pytorch.org/whl/cpu`) into per-node managed environments, so no pre-installed torch is needed.
 - The cross-machine YAMLs (`*_cross*.yml`) need two daemons and therefore cannot run on standard CI; the same-host variant (`cpu2cpu_cross_local.yml`) is covered by the torch-gated `memory-pool-smoke` nightly job.

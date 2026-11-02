@@ -356,7 +356,7 @@ Add new test files in the `tests/` directory. For tests that need the full CLI s
 2. Clean up stale processes with `dora down`
 3. Start cluster with `dora up`
 4. Run dataflow with `dora start --detach`
-5. Poll `dora list --json` for completion
+5. Poll `dora list --format json` for completion
 6. Clean up with `dora stop --all` and `dora down`
 
 **Local pattern** (single-process, in-process coordinator):
@@ -452,6 +452,7 @@ scripts/ros2-zenoh-interop.sh kilted all
 
 Run one case by replacing `all` with `topic-pub`, `topic-sub`,
 `service-client`, `service-server`, `action-client`, `action-server`, `graph`,
-`domain`, `namespace`, or `qos-transient-local`. The driver has bounded waits
-and always removes its containers. An environment-dependent skip is not proof
-of compatibility and must keep that profile incomplete.
+`domain`, `namespace`, `qos-transient-local`, `parameters`, or `rosout`. The
+driver has bounded waits and always removes its containers. An
+environment-dependent skip is not proof of compatibility and must keep that
+profile incomplete.

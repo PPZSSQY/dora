@@ -270,10 +270,7 @@ impl Listener {
                             Ok(()) => {}
                             Err(err) => tracing::error!("{err:?}"),
                         }
-                        // The subscribe channel's receiver goes with this
-                        // listener: wake anyone waiting for room in it so
-                        // they see it closed.
-                        listener.drained.notify.notify_waiters();
+                        listener.close_event_stream();
                     }
                     (Err(err), _) => {
                         tracing::warn!("failed to register node {dataflow_id}/{node_id}: {err}");
@@ -286,7 +283,12 @@ impl Listener {
                 }
             }
             other => {
-                tracing::warn!("expected register message, got `{other:?}`");
+                // The request kind only, never `{other:?}`: `ExtensionStore`
+                // and `ExtensionRequest` carry payloads of up to 64 MiB, which
+                // Debug formatting would amplify into a log line several times
+                // that size (see `request_kind`).
+                let kind = crate::local_listener::request_kind(&other);
+                tracing::warn!("expected register message, got `{kind}`");
                 let reply = DaemonReply::Result(Err("must send register message first".into()));
                 if let Err(err) = connection
                     .send_reply(reply)
@@ -408,6 +410,33 @@ impl Listener {
         batch
     }
 
+    /// Waits for the next subscribed event and returns the `NextEvent` reply
+    /// carrying it. The event goes through the queue, so the same
+    /// [`Self::take_queued_events_within_budget`] that bounds a queued reply
+    /// drops one that can never be framed, and the wait goes on: replying with
+    /// it would fail, leaving the node blocked on a reply that never comes.
+    async fn wait_for_next_events(&mut self) -> DaemonReply {
+        loop {
+            let Some(events) = self.subscribed_events.as_mut() else {
+                return DaemonReply::Result(Err(
+                    "Ignoring event request because no subscribe message was sent yet".into(),
+                ));
+            };
+            let Some(event) = events.recv().await else {
+                return DaemonReply::NextEvents(vec![]);
+            };
+            if let Some(counter) = &self.pending_counter {
+                counter.fetch_sub(1, Ordering::Relaxed);
+            }
+            self.note_drained();
+            self.enqueue(event);
+            let batch = self.take_queued_events_within_budget();
+            if !batch.is_empty() {
+                return DaemonReply::NextEvents(batch);
+            }
+        }
+    }
+
     #[tracing::instrument(skip(self, connection), fields(%self.dataflow_id, %self.node_id), level = "trace")]
     async fn handle_message<C: Connection>(
         &mut self,
@@ -520,24 +549,7 @@ impl Listener {
                 // reply fits one frame (see `NEXT_EVENTS_REPLY_BUDGET`).
                 let queued_events = self.take_queued_events_within_budget();
                 let reply = if queued_events.is_empty() {
-                    match self.subscribed_events.as_mut() {
-                        // wait for next event
-                        Some(events) => match events.recv().await {
-                            Some(event) => {
-                                if let Some(counter) = &self.pending_counter {
-                                    counter.fetch_sub(1, Ordering::Relaxed);
-                                }
-                                self.note_drained();
-                                DaemonReply::NextEvents(vec![event])
-                            }
-                            None => DaemonReply::NextEvents(vec![]),
-                        },
-                        None => {
-                            DaemonReply::Result(Err("Ignoring event request because no subscribe \
-                                message was sent yet"
-                                .into()))
-                        }
-                    }
+                    self.wait_for_next_events().await
                 } else {
                     DaemonReply::NextEvents(queued_events)
                 };
@@ -622,13 +634,14 @@ impl Listener {
                 )
                 .await?;
             }
-            // `DaemonRequest` is `#[non_exhaustive]`: a node built against a newer
-            // dora-node-api may send a request this daemon predates. Answer with an
-            // explicit error so the node fails loudly instead of hanging on a reply
-            // that never comes.
+            // Defensive: every variant this daemon knows is matched above. A
+            // variant it predates (from a node built against a newer
+            // dora-node-api) cannot reach here: it fails to decode, and
+            // `TcpConnection::receive_message` answers it with an error.
             other => {
                 let reply = DaemonReply::Result(Err(format!(
-                    "unsupported request from node (node is likely newer than this daemon): {other:?}"
+                    "unsupported request `{}` from node",
+                    crate::local_listener::request_kind(&other)
                 )));
                 self.send_reply(reply, connection).await?;
             }
@@ -703,6 +716,14 @@ impl Listener {
             // producer's next request must not be lost to that.
             let _ = pending.await;
         }
+    }
+
+    /// The subscribe channel's receiver goes with this listener: closes it
+    /// first, then wakes anyone held for room in it, so they see it closed
+    /// and end at once instead of after another stall tick.
+    fn close_event_stream(&mut self) {
+        drop(self.subscribed_events.take());
+        self.drained.notify.notify_waiters();
     }
 
     /// Wakes a producer held for this node's full channel
@@ -787,7 +808,7 @@ impl Listener {
 /// waited for any longer: the event is dropped, loudly, and counted as lost,
 /// and the receiver is marked `gave_up` so that its producers are not held
 /// for it again until it drains.
-async fn deliver_when_room(
+pub(crate) async fn deliver_when_room(
     delivery: DeferredDelivery,
     last_activity: &AtomicU64,
     ft_stats: &FaultToleranceStats,
@@ -798,6 +819,9 @@ async fn deliver_when_room(
         pending,
         drained,
         mut event,
+        // Dropped on return, once the event is in or given up on: a close
+        // waiting for it goes out only then (dora-rs/dora#3619).
+        held: _held,
     } = delivery;
     let mut stalled = Duration::ZERO;
     loop {
@@ -883,6 +907,7 @@ trait Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_tracing::TextCapture;
     use aligned_vec::AVec;
     use dora_core::config::DataId;
     use dora_message::{
@@ -969,10 +994,48 @@ mod tests {
             receiver: NodeId::from("sink".to_string()),
             channel: channel.clone(),
             pending: Some(pending.clone()),
+            held: drained.hold(&DataId::from("in".to_string())),
             drained: drained.clone(),
             event,
         };
         (delivery, pending)
+    }
+
+    /// Listener teardown closes the receiver's event channel and wakes the
+    /// deliveries held for it, so they end at once instead of waiting a
+    /// stall tick (or the stall limit) on a channel nobody reads any more.
+    /// Their waiting closes are released with them (dora-rs/dora#3619).
+    #[tokio::test(start_paused = true)]
+    async fn listener_teardown_ends_held_deliveries() {
+        let (mut listener, tx) = listener();
+        let clock = listener.clock.clone();
+        for _ in 0..NODE_EVENT_CHANNEL_CAPACITY {
+            tx.try_send(input(&clock, 0)).unwrap();
+        }
+        let (delivery, pending) = deferred(&tx, &listener.drained, input(&clock, 0));
+        let ft_stats = listener.backpressure.ft_stats.clone();
+        let deliver = tokio::spawn(async move {
+            deliver_when_room(delivery, &AtomicU64::new(0), &ft_stats).await
+        });
+        tokio::task::yield_now().await;
+        assert!(listener.drained.is_held(&DataId::from("in".to_string())));
+
+        listener.close_event_stream();
+        tokio::time::timeout(BACKPRESSURE_STALL_TICK / 2, deliver)
+            .await
+            .expect("the held delivery ends on teardown, without waiting a stall tick")
+            .unwrap();
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert!(!listener.drained.is_held(&DataId::from("in".to_string())));
+        assert_eq!(
+            listener
+                .backpressure
+                .ft_stats
+                .lost_backpressure_messages
+                .load(Ordering::Relaxed),
+            1,
+            "a receiver that went away without dropping its stream lost the message"
+        );
     }
 
     /// A deferred delivery lands only once the receiver's channel has the
@@ -1354,6 +1417,66 @@ mod tests {
         assert_eq!(listener.queued_bytes, 0);
     }
 
+    /// A connection that records every reply it is asked to send, failing
+    /// one that would not fit a frame as the TCP connection does.
+    #[derive(Default)]
+    struct RecordingReplies(Vec<DaemonReply>);
+
+    impl Connection for RecordingReplies {
+        async fn receive_message(&mut self) -> eyre::Result<Option<Timestamped<DaemonRequest>>> {
+            Ok(None)
+        }
+        async fn send_reply(&mut self, message: DaemonReply) -> eyre::Result<()> {
+            let len = dora_message::encode_presized(&message, message.encode_size_hint())?.len();
+            eyre::ensure!(
+                len <= dora_message::MAX_MESSAGE_BYTES,
+                "reply of {len} bytes exceeds the frame limit"
+            );
+            self.0.push(message);
+            Ok(())
+        }
+    }
+
+    /// The same undeliverable event, arriving while the node is already
+    /// waiting in `NextEvent` (the common case for an idle consumer), used to
+    /// be sent as-is: the oversized reply failed to frame, nothing was sent,
+    /// and the node blocked forever on its reply.
+    #[tokio::test]
+    async fn an_undeliverable_event_received_while_waiting_is_dropped() {
+        let (mut listener, tx) = listener();
+        let clock = listener.clock.clone();
+        tx.try_send(metadata_heavy_input(
+            &clock,
+            dora_message::MAX_MESSAGE_BYTES,
+        ))
+        .unwrap();
+        tx.try_send(input(&clock, 0)).unwrap();
+
+        let mut connection = RecordingReplies::default();
+        listener
+            .handle_message(
+                Timestamped {
+                    inner: DaemonRequest::NextEvent,
+                    timestamp: clock.new_timestamp(),
+                },
+                &mut connection,
+            )
+            .await
+            .expect("the NextEvent reply must be sent");
+
+        let [DaemonReply::NextEvents(events)] = connection.0.as_slice() else {
+            panic!(
+                "expected one NextEvents reply, got {} replies",
+                connection.0.len()
+            );
+        };
+        assert_eq!(events.len(), 1);
+        assert!(
+            encoded_reply_len(events.clone()) < MIB,
+            "the small event went out"
+        );
+    }
+
     #[test]
     fn saturation_is_by_event_count_or_payload_bytes() {
         assert!(!queue_saturated(LISTENER_QUEUE_MAX_EVENTS - 1, 0));
@@ -1394,5 +1517,71 @@ mod tests {
         assert_eq!(batch.len(), LISTENER_QUEUE_MAX_EVENTS);
         listener.handle_events().await.unwrap();
         assert_eq!(listener.queue.len(), 5, "room again: the channel drains");
+    }
+
+    /// A connection that yields one request, then reports a disconnect.
+    struct OneRequest(Option<Timestamped<DaemonRequest>>);
+
+    impl Connection for OneRequest {
+        fn receive_message(
+            &mut self,
+        ) -> impl Future<Output = eyre::Result<Option<Timestamped<DaemonRequest>>>> + Send {
+            let request = self.0.take();
+            async move { Ok(request) }
+        }
+        async fn send_reply(&mut self, _message: DaemonReply) -> eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A first request that is not `Register` is logged by kind. It used to
+    /// be Debug-formatted whole, so one `ExtensionStore` carrying up to
+    /// 64 MiB from any local process turned into a log line of several
+    /// hundred MB.
+    #[test]
+    fn non_register_first_request_is_logged_by_kind() {
+        let capture = TextCapture::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let clock = Arc::new(uhlc::HLC::default());
+        let request = Timestamped {
+            inner: DaemonRequest::ExtensionStore {
+                namespace: "ns".to_string(),
+                key: "key".to_string(),
+                value: vec![0u8; MIB],
+            },
+            timestamp: clock.new_timestamp(),
+        };
+
+        tracing::subscriber::with_default(capture.clone(), || {
+            rt.block_on(async {
+                let (daemon_tx, _daemon_rx) = mpsc::channel(1);
+                Listener::run(
+                    OneRequest(Some(request)),
+                    Arc::new(AtomicU64::new(0)),
+                    daemon_tx,
+                    clock,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(BackpressureConfig {
+                        outputs: Default::default(),
+                        ft_stats: Default::default(),
+                    }),
+                )
+                .await;
+            });
+        });
+
+        let logged = capture.0.lock().unwrap();
+        let line = logged
+            .iter()
+            .find(|line| line.contains("expected register message"))
+            .unwrap_or_else(|| panic!("rejection must be logged, got {logged:?}"));
+        assert!(line.contains("ExtensionStore"), "got: {line}");
+        assert!(
+            line.len() < 1024,
+            "the payload must not be logged ({} bytes)",
+            line.len()
+        );
     }
 }

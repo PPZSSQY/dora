@@ -8,7 +8,7 @@ use super::{Executable, default_tracing};
 use crate::common::parse_duration;
 use crate::{
     common::{
-        CoordinatorOptions, error_indicates_dataflow_finished, expect_reply,
+        CoordinatorOptions, coordinator_rejected, error_indicates_dataflow_finished, expect_reply,
         resolve_dataflow_identifier_interactive, send_control_request,
     },
     output::{
@@ -132,6 +132,7 @@ impl Executable for LogsArgs {
                         &config,
                     )
                 }
+                Err(err) if coordinator_rejected(&err) => local_logs_after_rejection(&self, err),
                 Err(_) => dispatch_local_logs(&self),
             };
         }
@@ -160,6 +161,7 @@ impl Executable for LogsArgs {
                     &config,
                 )
             }
+            Err(err) if coordinator_rejected(&err) => local_logs_after_rejection(&self, err),
             Err(_) => {
                 // Coordinator unavailable, fall back to local
                 dispatch_local_logs(&self)
@@ -181,6 +183,24 @@ fn dispatch_local_logs(args: &LogsArgs) -> Result<()> {
     } else {
         read_local_logs(args)
     }
+}
+
+/// Fall back to the local `out/` logs after a coordinator refused this CLI
+/// (rejected `--auth` token or version handshake).
+///
+/// The coordinator that refused us is not necessarily the one that ran the
+/// dataflow: a plain `dora run` never uses one, yet still finds it on the
+/// port, for example an older `dora up` left running across a CLI upgrade, or
+/// another user's `--auth` coordinator. So the local logs are still the right
+/// source, but say why the coordinator wasn't used. Without an `out/`
+/// directory there is nothing local to show, and the rejection, with its hint,
+/// is the useful error.
+fn local_logs_after_rejection(args: &LogsArgs, rejection: eyre::Report) -> Result<()> {
+    if !Path::new("out").exists() {
+        return Err(rejection);
+    }
+    eprintln!("warning: reading local logs from out/ instead: {rejection:#}\n");
+    dispatch_local_logs(args)
 }
 
 fn reject_legacy_node_arg(args: &LogsArgs) -> Result<()> {
@@ -894,9 +914,13 @@ fn find_node_log_files(dataflow_dir: &Path, node: &NodeId) -> Result<Vec<PathBuf
 }
 
 fn read_log_file(path: &Path) -> Result<Vec<LogMessage>> {
-    let content = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
-    Ok(parse_log_content(path, &content))
+    // Decode lossily, like `read_log_file_tracked`: a file whose tail ends
+    // inside a multi-byte UTF-8 sequence (a line the daemon is still writing,
+    // or one cut short by a crash) or a legacy `.txt` log holding raw console
+    // bytes must not make every log of the dataflow unreadable.
+    let bytes =
+        std::fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    Ok(parse_log_content(path, &String::from_utf8_lossy(&bytes)))
 }
 
 /// Read a log file for follow mode: the messages to print plus the follow state
@@ -1197,6 +1221,14 @@ fn all_nodes_logs_from_coordinator(
     Ok(())
 }
 
+/// Whether `msg` is the coordinator's notice that this reader missed lines,
+/// which is shown past the node and pattern filters.
+fn is_dropped_lines_notice(msg: &LogMessage) -> bool {
+    msg.fields
+        .as_ref()
+        .is_some_and(|fields| fields.contains_key(dora_message::common::DROPPED_LOG_LINES_FIELD))
+}
+
 /// Returns whether a log message should be kept given an optional node filter.
 /// `None` means no filtering (messages from every node pass); `Some(want)`
 /// keeps only messages whose node id equals `want`.
@@ -1295,6 +1327,13 @@ fn stream_logs_from_coordinator(
             serde_json::from_slice(&raw).context("failed to parse log message");
         match parsed {
             Ok(log_message) => {
+                // The coordinator's notice that this reader missed lines is
+                // about the whole stream, so the node and pattern filters
+                // must not hide it.
+                if is_dropped_lines_notice(&log_message) {
+                    print_log_message(log_message, config);
+                    continue;
+                }
                 if !matches_node_filter(log_message.node_id.as_ref().map(|n| n.as_ref()), want_node)
                 {
                     continue;
@@ -1603,6 +1642,25 @@ mod tests {
         let now = Utc::now();
         let msgs = vec![make_msg("a", None, None, now)];
         assert_eq!(apply_tail(msgs, Some(100)).len(), 1);
+    }
+
+    #[test]
+    fn dropped_lines_notice_is_recognised_by_its_field() {
+        let now = Utc::now();
+        let plain = make_msg("dropped 3 log line(s)", None, Some("coordinator"), now);
+        assert!(!is_dropped_lines_notice(&plain));
+        let mut notice = plain;
+        notice.fields = Some(
+            [(
+                dora_message::common::DROPPED_LOG_LINES_FIELD.to_owned(),
+                "3".to_owned(),
+            )]
+            .into(),
+        );
+        assert!(is_dropped_lines_notice(&notice));
+        // It is shown even though it matches neither of these filters.
+        assert!(!matches_node_filter(None, Some("camera")));
+        assert!(!matches_grep(&notice, Some("camera")));
     }
 
     // --- matches_grep ---
@@ -2034,6 +2092,29 @@ mod tests {
         // Only the newline-terminated prefix is consumed; the partial tail waits
         // for a later poll, and the stored offset is the raw byte offset.
         assert_eq!(state.offset, complete.len() as u64);
+    }
+
+    #[test]
+    fn read_log_file_tolerates_invalid_utf8() {
+        // `dora logs` without `--follow` used strict decoding, so one partial
+        // multi-byte character made the whole command fail.
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log_n.jsonl");
+        let mut raw = jsonl("日本語").into_bytes();
+        raw.extend_from_slice(b"{\"ts\":\"\xe4\xbd");
+        std::fs::write(&path, &raw).unwrap();
+        let msgs = read_log_file(&path).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message, "日本語");
+
+        // A legacy raw-text log keeps its lines, with the bad byte replaced.
+        let path = dir.path().join("log_n.txt");
+        std::fs::write(&path, b"before\nbad \xff byte\nafter").unwrap();
+        let msgs = read_log_file(&path).unwrap();
+        let lines: Vec<_> = msgs.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(lines, ["before", "bad \u{fffd} byte", "after"]);
     }
 
     fn snap_from(path: &Path, size: u64, content: &str) -> LogFileSnapshot {
