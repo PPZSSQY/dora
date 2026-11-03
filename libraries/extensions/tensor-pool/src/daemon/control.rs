@@ -310,12 +310,17 @@ pub(crate) fn resolve_cross_write_ack(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&(dataflow_id, shared_memory_id, seq))
     {
-        let result = if ok {
-            Ok(())
+        // Success must be an ExtensionReply of NodeResponse::Ok. A bare
+        // Result(Ok(())) is rejected by the node's extension_request.
+        // Failures stay Result(Err): that arm surfaces the message.
+        let reply = if ok {
+            super::handlers::node_reply(&crate::protocol::NodeResponse::Ok)
         } else {
-            Err(error.unwrap_or_else(|| "remote mirror write failed".to_string()))
+            DaemonReply::Result(Err(
+                error.unwrap_or_else(|| "remote mirror write failed".to_string()),
+            ))
         };
-        let _ = tx.send(DaemonReply::Result(result));
+        let _ = tx.send(reply);
         true
     } else {
         false
@@ -601,10 +606,14 @@ mod cross_write_failover_tests {
             None
         ));
         let result = rx.blocking_recv().expect("node reply delivered");
-        assert!(
-            matches!(result, DaemonReply::Result(Ok(()))),
-            "node must see the relay's success, not the stale direct failure"
-        );
+        match result {
+            DaemonReply::ExtensionReply { payload }
+                if postcard::from_bytes::<crate::protocol::NodeResponse>(&payload).ok()
+                    == Some(crate::protocol::NodeResponse::Ok) => {}
+            other => panic!(
+                "node must see the relay's success as an ExtensionReply, not {other:?}"
+            ),
+        }
     }
 
     /// Insert a pending write for `pool` the way the handler does (seq from
